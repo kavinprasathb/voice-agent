@@ -11,15 +11,20 @@ logger = logging.getLogger(__name__)
 
 
 class SarvamSTT:
-    """Streaming Speech-to-Text client for Sarvam AI."""
+    """Streaming Speech-to-Text client for Sarvam AI (Saaras v3)."""
 
-    def __init__(self, on_transcript: Callable, on_log: Callable = None):
+    MAX_RECONNECT = 3
+
+    def __init__(self, on_transcript: Callable, on_log: Callable = None, on_vad: Callable = None):
         self.on_transcript = on_transcript
         self.on_log = on_log
+        self.on_vad = on_vad  # Called with ("speech_start" | "speech_end")
         self.ws = None
         self._listen_task: Optional[asyncio.Task] = None
         self._connected = False
         self._chunks_sent = 0
+        self._reconnect_attempts = 0
+        self._should_run = True  # Set to False on intentional close
 
     def _log(self, msg):
         logger.info(msg)
@@ -27,17 +32,21 @@ class SarvamSTT:
             asyncio.ensure_future(self.on_log(f"[STT] {msg}"))
 
     async def connect(self):
-        """Open WebSocket connection to Sarvam STT."""
+        """Open WebSocket connection to Sarvam STT (Saaras v3 with VAD)."""
         params = (
             f"?language-code={config.LANGUAGE}"
             f"&model={config.STT_MODEL}"
+            f"&mode=transcribe"
             f"&sample_rate={config.SAMPLE_RATE}"
             f"&input_audio_codec=pcm_s16le"
+            f"&vad_signals=true"
+            f"&high_vad_sensitivity=true"
+            f"&flush_signal=true"
         )
         headers = {"Api-Subscription-Key": config.SARVAM_API_KEY}
 
         try:
-            self._log(f"Connecting to {config.SARVAM_STT_WS}...")
+            self._log(f"Connecting to {config.SARVAM_STT_WS} (model={config.STT_MODEL})...")
             self.ws = await websockets.connect(
                 config.SARVAM_STT_WS + params,
                 additional_headers=headers,
@@ -46,7 +55,8 @@ class SarvamSTT:
             )
             self._connected = True
             self._chunks_sent = 0
-            self._log("Connected OK")
+            self._reconnect_attempts = 0
+            self._log("Connected OK (Saaras v3 + VAD)")
             self._listen_task = asyncio.create_task(self._listen())
         except Exception as e:
             self._log(f"Connect FAILED: {e}")
@@ -87,14 +97,12 @@ class SarvamSTT:
             self._log(f"Flush failed: {e}")
 
     async def _listen(self):
-        """Listen for transcription results from Sarvam STT."""
-        self._log("Listener started, waiting for responses...")
+        """Listen for transcription results and VAD events from Sarvam STT."""
+        self._log("Listener started (Saaras v3 with VAD signals)...")
         try:
             async for message in self.ws:
                 data = json.loads(message)
                 msg_type = data.get("type", "")
-
-                self._log(f"Received: {str(data)[:150]}")
 
                 if msg_type == "data":
                     inner = data.get("data", {})
@@ -102,19 +110,24 @@ class SarvamSTT:
                     if transcript:
                         self._log(f"TRANSCRIPT: {transcript}")
                         await self.on_transcript(transcript, True)
+
                 elif msg_type == "events":
                     inner = data.get("data", {})
                     signal = inner.get("signal_type", "")
-                    self._log(f"VAD signal: {signal}")
+                    self._log(f"VAD: {signal}")
+                    if self.on_vad and signal in ("speech_start", "speech_end"):
+                        await self.on_vad(signal)
+
                 elif msg_type == "error":
                     err = data.get("data", {})
                     self._log(f"ERROR from Sarvam: {err}")
+
                 else:
                     # Fallback format
                     transcript = data.get("transcript", "")
                     is_final = data.get("is_final", False)
                     if transcript:
-                        self._log(f"TRANSCRIPT (v2): {transcript} (final={is_final})")
+                        self._log(f"TRANSCRIPT (fallback): {transcript} (final={is_final})")
                         await self.on_transcript(transcript, is_final)
 
         except websockets.exceptions.ConnectionClosed as e:
@@ -124,9 +137,16 @@ class SarvamSTT:
         finally:
             self._log(f"Listener stopped. Total chunks sent: {self._chunks_sent}")
             self._connected = False
+            # Auto-reconnect if call still active
+            if self._should_run and self._reconnect_attempts < self.MAX_RECONNECT:
+                self._reconnect_attempts += 1
+                self._log(f"Auto-reconnecting STT (attempt {self._reconnect_attempts}/{self.MAX_RECONNECT})...")
+                await asyncio.sleep(1)
+                await self.connect()
 
     async def close(self):
         """Close the STT connection."""
+        self._should_run = False
         self._connected = False
         if self._listen_task:
             self._listen_task.cancel()

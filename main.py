@@ -1,5 +1,7 @@
 import json
 import logging
+import re
+from typing import List, Optional
 
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -19,20 +21,56 @@ app = FastAPI(title="Voice Agent - Order Confirmation")
 # Active call sessions
 sessions: dict[str, VoiceAgent] = {}
 
+# Pending orders waiting for Exotel WebSocket callback (keyed by normalized phone number)
+pending_orders: dict[str, dict] = {}
+
+
+def _normalize_phone(phone: str) -> str:
+    """Normalize phone number to last 10 digits for matching."""
+    digits = re.sub(r'\D', '', phone)
+    return digits[-10:] if len(digits) >= 10 else digits
+
 
 @app.get("/")
 async def health():
     return {"status": "ok", "active_calls": len(sessions)}
 
 
+class OrderItem(BaseModel):
+    name: str
+    qty: int
+    price: float
+
+
 class CallRequest(BaseModel):
-    to: str  # Vendor phone number (e.g. "918072293726")
+    phone_number: str
+    vendor_name: str
+    company_name: str = "Keeggi"
+    order_id: str
+    items: List[OrderItem]
 
 
 @app.post("/call")
 async def trigger_call(req: CallRequest):
-    """Trigger an outbound call to a vendor via Exotel."""
-    logger.info(f"Triggering call to {req.to}")
+    """Trigger an outbound call to a vendor with dynamic order data."""
+    phone = req.phone_number
+    logger.info(f"Triggering call to {phone} | order={req.order_id} vendor={req.vendor_name}")
+
+    # Build order data dict
+    order_data = {
+        "order_id": req.order_id,
+        "vendor_name": req.vendor_name,
+        "company_name": req.company_name,
+        "items": [{"name": i.name, "qty": i.qty, "price": i.price} for i in req.items],
+    }
+
+    # Store for WebSocket pickup (keyed by normalized phone)
+    norm_phone = _normalize_phone(phone)
+    pending_orders[norm_phone] = order_data
+    logger.info(f"Stored pending order for {norm_phone}: {req.order_id}")
+
+    # Ensure phone has country code for Exotel
+    exotel_phone = phone if phone.startswith("91") else f"91{phone}"
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -40,8 +78,8 @@ async def trigger_call(req: CallRequest):
                 config.EXOTEL_API_URL,
                 auth=(config.EXOTEL_API_KEY, config.EXOTEL_API_TOKEN),
                 data={
-                    "From": req.to,
-                    "To": req.to,
+                    "From": exotel_phone,
+                    "To": exotel_phone,
                     "CallerId": config.EXOTEL_PHONE_NUMBER,
                     "Url": f"http://my.exotel.com/exoml/start/{config.EXOTEL_APP_ID}",
                 },
@@ -49,10 +87,20 @@ async def trigger_call(req: CallRequest):
             logger.info(f"Exotel response: {resp.status_code} {resp.text[:300]}")
 
             if resp.status_code == 200:
-                return {"status": "ok", "message": f"Call initiated to {req.to}"}
+                call_data = resp.json()
+                call_sid = call_data.get("Call", {}).get("Sid", "")
+                return {
+                    "status": "ok",
+                    "message": f"Call initiated to {phone}",
+                    "call_sid": call_sid,
+                    "order_id": req.order_id,
+                }
             else:
+                # Clean up pending order on failure
+                pending_orders.pop(norm_phone, None)
                 return {"status": "error", "code": resp.status_code, "detail": resp.text[:300]}
     except Exception as e:
+        pending_orders.pop(norm_phone, None)
         logger.error(f"Failed to trigger call: {e}")
         return {"status": "error", "detail": str(e)}
 
@@ -88,10 +136,21 @@ async def exotel_websocket(ws: WebSocket):
                     f"| format={media_format} | stream={stream_sid}"
                 )
 
+                # Look up pending order by phone number
+                order_data = None
+                if from_number:
+                    norm = _normalize_phone(from_number)
+                    order_data = pending_orders.pop(norm, None)
+                    if order_data:
+                        logger.info(f"Found pending order for {norm}: {order_data['order_id']}")
+                    else:
+                        logger.info(f"No pending order for {norm}, using default")
+
                 agent = VoiceAgent(
                     exotel_ws=ws,
                     stream_sid=stream_sid,
                     call_sid=call_sid,
+                    order_data=order_data,
                 )
                 sessions[stream_sid] = agent
                 await agent.start()

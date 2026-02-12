@@ -17,15 +17,16 @@ logger = logging.getLogger(__name__)
 class VoiceAgent:
     """Orchestrates a single call session: Exotel <-> STT <-> LLM <-> TTS."""
 
-    # Echo suppression: don't send audio to STT for this long after TTS finishes
+    # Echo suppression: buffer after TTS finishes to account for telephony round-trip latency
     ECHO_BUFFER_MS = 2500
     # Server-side flush: if no audio sent to STT for this long, flush
     FLUSH_AFTER_MS = 2000
 
-    def __init__(self, exotel_ws: WebSocket, stream_sid: str, call_sid: str):
+    def __init__(self, exotel_ws: WebSocket, stream_sid: str, call_sid: str, order_data: Optional[dict] = None):
         self.exotel_ws = exotel_ws
         self.stream_sid = stream_sid
         self.call_sid = call_sid
+        self.order_data = order_data or config.DEFAULT_ORDER
 
         self.stt: Optional[SarvamSTT] = None
         self.tts: Optional[SarvamTTS] = None
@@ -40,6 +41,19 @@ class VoiceAgent:
         self._tts_last_finished = 0  # timestamp when TTS last finished speaking
         self._last_audio_sent_time = 0  # timestamp of last audio chunk sent to STT
         self._flush_task: Optional[asyncio.Task] = None
+
+        # Track last agent response for echo detection
+        self._last_agent_text = ""
+
+        # Track TTS audio duration for accurate silence timeout
+        self._tts_audio_bytes = 0  # total audio bytes for current utterance
+        self._tts_speak_start = 0.0  # when speak() was called
+
+        # Silence timeout: re-prompt if no user response
+        self._silence_timeout_task: Optional[asyncio.Task] = None
+        self._silence_timeout_sec = 10  # seconds to wait after audio finishes playing
+        self._silence_prompts_sent = 0  # track how many silence prompts we've sent
+        self._max_silence_prompts = 2  # max re-prompts before giving up
 
         # Final status keywords the LLM outputs
         self._status_keywords = [
@@ -61,9 +75,20 @@ class VoiceAgent:
         """Initialize all AI services and send greeting."""
         await self._send_log("Starting voice agent...")
 
-        self.llm = SarvamLLM()
-        self.stt = SarvamSTT(on_transcript=self._on_transcript, on_log=self._send_log)
-        self.tts = SarvamTTS(on_audio=self._on_tts_audio, on_log=self._send_log, on_done=self._on_tts_done)
+        self.llm = SarvamLLM(system_prompt=config.build_system_prompt(self.order_data))
+        self.stt = SarvamSTT(on_transcript=self._on_transcript, on_log=self._send_log, on_vad=self._on_vad)
+
+        # Use telephony codec for real Exotel calls, mp3 for browser tester
+        is_real_call = not self.call_sid.startswith("test-")
+        if is_real_call:
+            self.tts = SarvamTTS(
+                on_audio=self._on_tts_audio, on_log=self._send_log, on_done=self._on_tts_done,
+                codec=config.TTS_CODEC_TELEPHONY, sample_rate=config.TTS_SAMPLE_RATE_TELEPHONY,
+            )
+        else:
+            self.tts = SarvamTTS(
+                on_audio=self._on_tts_audio, on_log=self._send_log, on_done=self._on_tts_done,
+            )
 
         await self.stt.connect()
         await self.tts.connect()
@@ -76,7 +101,10 @@ class VoiceAgent:
         await asyncio.sleep(1)
 
         # Send full greeting
-        await self._speak(config.GREETING)
+        greeting = config.build_greeting(self.order_data)
+        self._last_agent_text = greeting
+        await self._speak(greeting)
+        # Silence timeout will start when TTS finishes (in _on_tts_done)
 
     async def handle_media(self, payload: str):
         """Handle incoming audio from Exotel — forward to STT with echo suppression."""
@@ -155,6 +183,17 @@ class VoiceAgent:
             await self._send_log("Ignoring — agent is still speaking")
             return
 
+        # Echo detection: reject if transcript matches agent's own recent words
+        if self._last_agent_text and len(text) > 5:
+            # Check if significant portion of transcript appears in last agent response
+            text_lower = text.lower()
+            agent_lower = self._last_agent_text.lower()
+            if text_lower in agent_lower or any(
+                word in agent_lower for word in text_lower.split() if len(word) > 4
+            ):
+                await self._send_log(f"Ignoring echo transcript: '{text[:40]}...'")
+                return
+
         if not is_final:
             return
 
@@ -163,12 +202,16 @@ class VoiceAgent:
             return
 
         self._processing = True
+        self._silence_prompts_sent = 0  # Reset on real user response
         try:
             await self._send_log(f"Thinking...")
             response = await self.llm.chat(text)
             await self._send_log(f"Agent: {response}")
 
-            # Speak the response first
+            # Track for echo detection
+            self._last_agent_text = response
+
+            # Speak the full response at once (avoids audio gaps)
             await self._speak(response)
 
             # Check if the response indicates call is ending
@@ -176,6 +219,7 @@ class VoiceAgent:
             if status:
                 await self._send_webhook(status)
                 await self._end_call(status)
+            # Silence timeout will restart when TTS finishes (in _on_tts_done)
         except Exception as e:
             await self._send_log(f"Error: {e}")
         finally:
@@ -242,10 +286,10 @@ class VoiceAgent:
         self._call_ended = True
 
         payload = {
-            "order_id": config.TEST_ORDER["order_id"],
-            "vendor_name": config.TEST_ORDER["vendor_name"],
-            "company": config.TEST_ORDER["company_name"],
-            "total_amount": config.TOTAL_AMOUNT,
+            "order_id": self.order_data["order_id"],
+            "vendor_name": self.order_data["vendor_name"],
+            "company": self.order_data["company_name"],
+            "total_amount": config._calc_total(self.order_data),
             "status": status,
             "call_sid": self.call_sid,
         }
@@ -263,7 +307,7 @@ class VoiceAgent:
             logger.error(f"Webhook error: {e}")
 
     async def _end_call(self, status: str):
-        """Notify the browser of the result and end the call."""
+        """Notify the browser of the result and hang up the Exotel call."""
         status_labels = {
             "ACCEPTED": "Order Accepted",
             "REJECTED": "Order Rejected",
@@ -273,9 +317,10 @@ class VoiceAgent:
         }
         label = status_labels.get(status, status)
 
-        # Wait a moment for TTS to finish playing
-        await asyncio.sleep(3)
+        # Wait for TTS to finish playing the goodbye message
+        await asyncio.sleep(5)
 
+        # Notify browser tester (if connected via browser)
         try:
             await self.exotel_ws.send_json({
                 "event": "end_call",
@@ -285,19 +330,117 @@ class VoiceAgent:
         except Exception:
             pass
 
+        # Hang up the real Exotel call via REST API
+        await self._hangup_exotel_call()
+
         await self._send_log(f"Call ended — {label}")
         logger.info(f"Call ended for {self.call_sid}: {status}")
 
+    async def _hangup_exotel_call(self):
+        """Hang up the Exotel call by closing the WebSocket.
+
+        Exotel advances to the next applet (Hangup) when the WebSocket closes.
+        """
+        if not self.call_sid or self.call_sid.startswith("test-"):
+            return  # Skip for browser tester
+
+        try:
+            await self.exotel_ws.close()
+            await self._send_log("Closed WebSocket — Exotel will hangup")
+            logger.info("Closed WebSocket to trigger Exotel hangup")
+        except Exception as e:
+            logger.error(f"WebSocket close error: {e}")
+
     async def _on_tts_done(self):
-        """Called when TTS finishes speaking — mark timestamp for echo suppression."""
-        self._tts_last_finished = asyncio.get_event_loop().time() * 1000
-        await self._send_log("TTS done — echo buffer active")
+        """Called when TTS finishes generating — wait for playback then start silence timeout."""
+        now = asyncio.get_event_loop().time()
+        self._tts_last_finished = now * 1000
+
+        # Cancel any existing silence timeout IMMEDIATELY (before sleep)
+        # This prevents an earlier timeout (e.g. from "ஹலோ") from firing
+        # while we wait for this utterance's playback to finish
+        self._cancel_silence_timeout()
+
+        # Estimate how long the audio takes to play vs how long TTS took to generate
+        # Audio is PCM 16-bit at telephony sample rate (8000 Hz) → 16000 bytes/sec
+        sample_rate = config.TTS_SAMPLE_RATE_TELEPHONY if not self.call_sid.startswith("test-") else config.TTS_SAMPLE_RATE
+        playback_sec = self._tts_audio_bytes / (sample_rate * 2) if self._tts_audio_bytes > 0 else 0
+        generation_sec = now - self._tts_speak_start if self._tts_speak_start > 0 else 0
+        remaining_playback = max(0, playback_sec - generation_sec)
+
+        await self._send_log(
+            f"TTS done — audio={playback_sec:.1f}s, generated in {generation_sec:.1f}s, "
+            f"playback remaining={remaining_playback:.1f}s"
+        )
+
+        # Wait for audio to finish playing on the phone, then start silence timeout
+        if remaining_playback > 0:
+            await asyncio.sleep(remaining_playback)
+            # Update echo buffer timestamp to after playback finishes
+            self._tts_last_finished = asyncio.get_event_loop().time() * 1000
+
+        if not self._call_ended and not self._processing:
+            self._start_silence_timeout()
+
+    def _start_silence_timeout(self):
+        """Start a timeout that re-prompts the vendor if they don't respond."""
+        if self._silence_timeout_task and not self._silence_timeout_task.done():
+            self._silence_timeout_task.cancel()
+        self._silence_timeout_task = asyncio.create_task(self._silence_timeout_handler())
+
+    def _cancel_silence_timeout(self):
+        """Cancel the silence timeout (user responded)."""
+        if self._silence_timeout_task and not self._silence_timeout_task.done():
+            self._silence_timeout_task.cancel()
+            self._silence_timeout_task = None
+
+    async def _silence_timeout_handler(self):
+        """Wait for silence_timeout_sec, then re-prompt or end call."""
+        try:
+            await asyncio.sleep(self._silence_timeout_sec)
+            if self._call_ended or self._processing:
+                return
+
+            self._silence_prompts_sent += 1
+            if self._silence_prompts_sent > self._max_silence_prompts:
+                # Too many unanswered prompts — end call
+                await self._send_log("No response after multiple prompts — ending call")
+                response = "சரி சார்... அப்புறம் ட்ரை பண்றேன்."
+                self._last_agent_text = response
+                await self._speak(response)
+                await self._send_webhook("NO_RESPONSE")
+                await self._end_call("NO_RESPONSE")
+                return
+
+            # Re-prompt the vendor
+            await self._send_log(f"Silence timeout — prompting vendor (attempt {self._silence_prompts_sent})")
+            prompt = "ஹலோ... இருக்கீங்களா?... ஆர்டர் அக்செப்ட் பண்றீங்களா... இல்ல ரிஜெக்ட் பண்றீங்களா?"
+            self._last_agent_text = prompt
+            await self._speak(prompt)
+            # Next silence timeout will start when TTS finishes (in _on_tts_done)
+        except asyncio.CancelledError:
+            pass
+
+    async def _on_vad(self, signal: str):
+        """Handle VAD events from Saaras v3 STT."""
+        if signal == "speech_start":
+            await self._send_log("VAD: user speech detected")
+            # User is speaking — cancel silence timeout
+            self._cancel_silence_timeout()
+        elif signal == "speech_end":
+            await self._send_log("VAD: user speech ended — flushing STT")
+            if self.stt and self.stt._connected and not self._call_ended:
+                await self.stt.flush()
 
     async def _speak(self, text: str):
         if self.tts:
+            self._tts_audio_bytes = 0
+            self._tts_speak_start = asyncio.get_event_loop().time()
             await self.tts.speak(text)
 
     async def _on_tts_audio(self, audio_base64: str):
+        # Track audio bytes for playback duration estimation
+        self._tts_audio_bytes += len(audio_base64) * 3 // 4  # base64 → raw bytes
         try:
             await self.exotel_ws.send_json({
                 "event": "media",
@@ -323,6 +466,7 @@ class VoiceAgent:
 
     async def stop(self):
         logger.info(f"Agent stopping for call {self.call_sid}")
+        self._cancel_silence_timeout()
         if self._flush_task and not self._flush_task.done():
             self._flush_task.cancel()
         if self.stt:

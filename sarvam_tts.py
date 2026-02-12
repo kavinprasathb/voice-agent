@@ -13,10 +13,13 @@ logger = logging.getLogger(__name__)
 class SarvamTTS:
     """Streaming Text-to-Speech client for Sarvam AI."""
 
-    def __init__(self, on_audio: Callable, on_log: Callable = None, on_done: Callable = None):
+    def __init__(self, on_audio: Callable, on_log: Callable = None, on_done: Callable = None,
+                 codec: str = None, sample_rate: int = None):
         self.on_audio = on_audio
         self.on_log = on_log
         self.on_done = on_done
+        self._codec = codec or config.TTS_CODEC
+        self._sample_rate = sample_rate or config.TTS_SAMPLE_RATE
         self.ws = None
         self._listen_task: Optional[asyncio.Task] = None
         self._speaking = False
@@ -49,11 +52,13 @@ class SarvamTTS:
                 "data": {
                     "speaker": config.SPEAKER,
                     "target_language_code": config.LANGUAGE,
-                    "output_audio_codec": "linear16",
-                    "speech_sample_rate": str(config.TTS_SAMPLE_RATE),
+                    "output_audio_codec": self._codec,
+                    "speech_sample_rate": str(self._sample_rate),
                     "pace": config.TTS_PACE,
                     "enable_preprocessing": True,
                     "model": config.TTS_MODEL,
+                    "min_buffer_size": config.TTS_MIN_BUFFER,
+                    "max_chunk_length": config.TTS_MAX_CHUNK,
                 }
             }))
 

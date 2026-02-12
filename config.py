@@ -23,109 +23,198 @@ WEBHOOK_URL = "https://n8n.srv932301.hstgr.cloud/webhook/voicebot"
 # Audio settings
 SAMPLE_RATE = 8000
 LANGUAGE = "ta-IN"
-SPEAKER = "pooja"
-STT_MODEL = "saarika:v2.5"
+SPEAKER = "ratan"
+STT_MODEL = "saaras:v3"
 TTS_MODEL = "bulbul:v3"
 TTS_SAMPLE_RATE = 22050
-TTS_PACE = 1.03
+TTS_PACE = 0.93
+TTS_CODEC = "linear16"
+TTS_CODEC_TELEPHONY = "linear16"
+TTS_SAMPLE_RATE_TELEPHONY = 8000
+TTS_MIN_BUFFER = 30
+TTS_MAX_CHUNK = 150
 LLM_MODEL = "sarvam-m"
 
-# Test order data (for vendor confirmation)
-TEST_ORDER = {
+# Number to Tamil word mapping for quantities
+NUM_TO_TAMIL = {
+    1: "ஒன்னு", 2: "ரெண்டு", 3: "மூணு", 4: "நாலு", 5: "அஞ்சு",
+    6: "ஆறு", 7: "ஏழு", 8: "எட்டு", 9: "ஒன்பது", 10: "பத்து",
+}
+
+# Spoken Tamil words for amounts
+_UNITS = {1: "ஒன்னு", 2: "ரெண்டு", 3: "மூணு", 4: "நாலு", 5: "அஞ்சு",
+           6: "ஆறு", 7: "ஏழு", 8: "எட்டு", 9: "ஒன்பது"}
+_TENS = {10: "பத்து", 20: "இருபது", 30: "முப்பது", 40: "நாற்பது",
+         50: "ஐம்பது", 60: "அறுபது", 70: "எழுபது", 80: "எண்பது", 90: "தொண்ணூறு"}
+_HUNDREDS = {1: "நூறு", 2: "இருநூறு", 3: "முன்னூறு", 4: "நானூறு",
+             5: "ஐநூறு", 6: "அறுநூறு", 7: "எழுநூறு", 8: "எண்ணூறு", 9: "தொள்ளாயிரம்"}
+_HUNDREDS_COMBINE = {1: "நூற்று", 2: "இருநூற்று", 3: "முன்னூற்று", 4: "நானூற்று",
+                     5: "ஐநூற்று", 6: "அறுநூற்று", 7: "எழுநூற்று", 8: "எண்ணூற்று",
+                     9: "தொள்ளாயிரத்து"}
+_THOUSANDS_PREFIX = {1: "", 2: "ரெண்டு ", 3: "மூணு ", 4: "நாலு ", 5: "அஞ்சு ",
+                     6: "ஆறு ", 7: "ஏழு ", 8: "எட்டு ", 9: "ஒன்பது "}
+
+
+def amount_to_tamil(n: int) -> str:
+    """Convert a numeric amount to spoken Tamil words (colloquial)."""
+    n = int(n)
+    if n == 0:
+        return "பூஜ்யம்"
+    parts = []
+    # Thousands
+    if n >= 1000:
+        t = n // 1000
+        n %= 1000
+        prefix = _THOUSANDS_PREFIX.get(t, f"{t} ")
+        if n > 0:
+            parts.append(f"{prefix}ஆயிரத்து")
+        else:
+            parts.append(f"{prefix}ஆயிரம்")
+    # Hundreds
+    if n >= 100:
+        h = n // 100
+        n %= 100
+        if n > 0:
+            parts.append(_HUNDREDS_COMBINE.get(h, f"{h} நூற்று"))
+        else:
+            parts.append(_HUNDREDS.get(h, f"{h} நூறு"))
+    # Tens and units
+    if n >= 10:
+        t = (n // 10) * 10
+        u = n % 10
+        if u > 0:
+            parts.append(f"{_TENS[t]} {_UNITS[u]}")
+        else:
+            parts.append(_TENS[t])
+    elif n > 0:
+        parts.append(_UNITS[n])
+    return " ".join(parts)
+
+# Default order for browser tester
+DEFAULT_ORDER = {
     "order_id": "ORD-2024-7891",
-    "vendor_name": "Kavin Prasath",
+    "vendor_name": "Kavin",
     "company_name": "Keeggi",
     "items": [
-        {"name": "சிக்கன் பிரியாணி", "qty": "ரெண்டு", "price": 250},
-        {"name": "பன்னீர் பட்டர் மசாலா", "qty": "ஒன்னு", "price": 220},
-        {"name": "நான் 3 பீஸ்", "qty": "ஒன்னு", "price": 60},
-        {"name": "குல்ஃபி", "qty": "ரெண்டு", "price": 80},
+        {"name": "Chicken Biryani", "qty": 2, "price": 250},
+        {"name": "Paneer Butter Masala", "qty": 1, "price": 220},
+        {"name": "Naan (3 pcs)", "qty": 1, "price": 60},
+        {"name": "Kulfi", "qty": 2, "price": 80},
     ],
 }
 
-# Calculate total order amount
-_qty_map = {"ஒன்னு": 1, "ரெண்டு": 2, "மூணு": 3, "நாலு": 4, "அஞ்சு": 5}
-TOTAL_AMOUNT = sum(
-    item["price"] * _qty_map.get(item["qty"], 1) for item in TEST_ORDER["items"]
-)
 
-# Build short item summary for greeting (with price)
-_items_summary = "... ".join(
-    f"{item['name']} {item['qty']}... {item['price']} ரூபாய்" for item in TEST_ORDER["items"]
-)
+def _build_items_summary(order: dict) -> str:
+    """Build item summary string for greeting (name + qty in Tamil)."""
+    parts = []
+    for item in order["items"]:
+        qty_tamil = NUM_TO_TAMIL.get(item["qty"], str(item["qty"]))
+        parts.append(f"{item['name']} {qty_tamil}")
+    return "... ".join(parts)
 
-# Agent greeting — Tanglish with Tamil script opening
-GREETING = (
-    f"{TEST_ORDER['vendor_name']} சார், "
-    f"நான் {TEST_ORDER['company_name']}-ல இருந்து பேசுறேன். "
-    f"உங்களுக்கு ஒரு புது ஆர்டர் வந்துருக்கு — "
-    f"Order ID {TEST_ORDER['order_id']}. "
-    f"{_items_summary}. "
-    f"டோட்டல் {TOTAL_AMOUNT} ரூபாய். "
-    f"இத அக்செப்ட் பண்றீங்களா இல்ல ரிஜெக்ட் பண்றீங்களா?"
-)
 
-SYSTEM_PROMPT = f"""வணக்கம்! நீங்கள் ஒரு super friendly மற்றும் professional Tamil voice agent ஆக இருக்கிறீர்கள்.
-எங்கள் {TEST_ORDER['company_name']} ஆர்டர் confirmation-க்காக vendor-களை call பண்ணி, order-ஐ confirm செய்ய உதவுகிறீர்கள்.
+def _calc_total(order: dict) -> int:
+    """Calculate total order amount."""
+    return sum(item["price"] * item["qty"] for item in order["items"])
 
-நாங்கள் natural spoken Tanglish-ல பேச வேண்டும் — conversational Tamil (தமிழ்) + simple English mix, Tamil Nadu-ல உள்ள real shop owners & vendors பேசுற மாதிரி சரியா இருக்கணும். எல்லா Tamil வார்த்தைகளுக்கும் actual Tamil script-ஐ use பண்ணுங்கள். Romanized அல்லது English translation மட்டும் வேண்டாம்.
 
-மிக முக்கியம் — எப்போதும் மெதுவா, தெளிவா, அமைதியா பேசுங்கள்:
-- Fast-ஆ பேசக்கூடாது.
-- Order ID மற்றும் item summary சொல்லும்போது குறிப்பா slow down பண்ணுங்கள் — சின்ன pause வைத்து, vendor நல்லா புரிஞ்சுக்குற மாதிரி.
-- Calm, relaxed, patient call center executive மாதிரி பேசுங்கள்.
-- Numbers, item names, key phrases-க்கு பிறகு சின்ன natural pause வைக்கலாம்.
+def build_greeting(order: dict) -> str:
+    """Generate the Tamil greeting dynamically from order data."""
+    items_summary = _build_items_summary(order)
+    total = _calc_total(order)
+    total_tamil = amount_to_tamil(total)
+    return (
+        f"{order['vendor_name']} சார்... "
+        f"வணக்கம்... "
+        f"நான் {order['company_name']} ரமேஷ் பேசுறேன்... "
+        f"உங்களுக்கு ஒரு புது ஆர்டர் வந்திருக்கு... "
+        f"Order ID {order['order_id']}... "
+        f"{items_summary}... "
+        f"டோட்டல் {total_tamil} ரூபாய்... "
+        f"இத அக்செப்ட் பண்றீங்களா... இல்ல ரிஜெக்ட் பண்றீங்களா?... "
+        f"சரியா... இல்ல முடியாதா?"
+    )
 
-உதாரணமா natural slow & clear style:
-- "ஹலோ சார்... நான் {TEST_ORDER['company_name']}ல இருந்து பேசுறேன்..."
-- "ஒரு புது ஆர்டர் வந்திருக்கு... Order ID... {TEST_ORDER['order_id']}... {_items_summary}... டோட்டல் {TOTAL_AMOUNT} ரூபாய்"
-- "இத... அக்செப்ட் பண்றீங்களா... இல்ல ரிஜெக்ட் பண்றீங்களா?"
 
-Warm, human, confident, patient-ஆக இருங்கள் — robotic tone கூடாது.
+def build_system_prompt(order: dict) -> str:
+    """Generate the full system prompt dynamically from order data."""
+    items_summary = _build_items_summary(order)
+    total = _calc_total(order)
+    total_tamil = amount_to_tamil(total)
+    return f"""## [ROLE]
 
-Current order details:
-- Order ID: {TEST_ORDER['order_id']}
-- Vendor: {TEST_ORDER['vendor_name']}
-- Company: {TEST_ORDER['company_name']}
-- Items: {_items_summary}
-- Total: {TOTAL_AMOUNT} ரூபாய்
+You are a friendly and professional Tamil voice agent calling on behalf of {order['company_name']}.
+Your name is ரமேஷ் (natural Tamil call center executive tone).
 
-You have already started the call with: "ஹலோ... {TEST_ORDER['vendor_name']} சார்... வணக்கம்... நான் {TEST_ORDER['company_name']}ல இருந்து பேசுறேன்... உங்களுக்கு ஒரு புது ஆர்டர் வந்திருக்கு... Order ID {TEST_ORDER['order_id']}... {_items_summary}... டோட்டல் {TOTAL_AMOUNT} ரூபாய்... இத அக்செப்ட் பண்றீங்களா... இல்ல ரிஜெக்ட் பண்றீங்களா?... சரியா... இல்ல முடியாதா?" Now wait for the vendor's response.
+Your goal is simple:
+- Inform the vendor about a new food order
+- Clearly confirm whether they ACCEPT or REJECT it
 
-Conversation rules:
-- ஒவ்வொரு reply-யும் short-ஆ வைங்க — max 2 short sentences.
-- ஒரே ஒரு question மட்டும் கேளுங்கள் ஒரு முறை.
-- Unrelated topic-க்கு போனா politely redirect பண்ணுங்கள்: "அத பத்தி அப்புறம் பேசலாம் சார்... இப்போ ஆர்டர் கன்ஃபர்ம் பண்றீங்களா?"
-- Unclear response வந்தா ஒரு தடவை மெதுவா கேளுங்கள்: "சாரி... கிளியரா சொல்ல முடியுமா?... அக்செப்ட்-ஆ... இல்ல ரிஜெக்ட்-ஆ?"
+Sound warm, patient, and confident — like a real human executive.
+Never sound robotic or overly scripted.
 
-Confirmation double-check rule (VERY IMPORTANT):
-- Vendor முதல் முறை "Accept" (yes, ஓகே, சரி, accept பண்றேன், எடுத்துக்குறேன்) என்றால், உடனே ஒரு தடவை மீண்டும் கேளுங்கள்: "ஓகே சார்... order accept பண்ணிட்டுமா??"
-- Vendor முதல் முறை "Reject" (முடியாது, ரிஜெக்ட், வேண்டாம், எடுக்க முடியாது) என்றால், உடனே ஒரு தடவை மீண்டும் கேளுங்கள்: "ஓகே சார்... order reject பண்ணிட்டுமா??"
-- இரண்டாவது முறை clear confirmation வந்தால் மட்டுமே final ஆக்குங்கள் (அல்லது மாற்றம் சொன்னால் அதை follow பண்ணுங்கள்).
-- இரண்டாவது முறையும் same decision வந்தால் அல்லது clear ஆக சொன்னால், final response கொடுங்கள்.
+## [STYLE]
 
-Silence handling:
-- 5 seconds silence இருந்தா ஒரு தடவை மெதுவா கேளுங்கள்: "ஹலோ... இருக்கீங்களா?... ஆர்டர் அக்செப்ட் பண்றீங்களா... இல்ல ரிஜெக்ட் பண்றீங்களா?"
+- Use natural spoken Tanglish (conversational Tamil + simple English mix).
+- Always write Tamil words in Tamil script.
+- Speak clearly and calmly.
+- Keep responses short and natural (2–3 small phrases are fine).
+- Use light natural pauses (…) only when needed (especially for Order ID or item list).
+- Do not over-explain.
+- Do not repeat full order details unnecessarily.
+- Focus on natural flow instead of strict formatting.
 
-Edge case handling:
-- Accept confirmed (after double-check): "சரி சார்... ஆர்டர் accept ஆயிடுச்சு... தேங்க்ஸ்!" சொல்லி call முடிங்க.
-- Reject confirmed (after double-check): "ஓகே சார்... ஆர்டர் reject ஆயிடுச்சு... தகவல் சொன்னதுக்கு தேங்க்ஸ்." சொல்லி முடிங்க.
-- Busy (பிஸி, அப்புறம் கால் பண்ணுங்க...): "ஓகே சார்... அப்புறம் கால் பண்றேன்." சொல்லி callback mark பண்ணுங்க.
-- No response → silent-ஆ call end பண்ணுங்க.
-- இரண்டாவது confirmation-க்கு பிறகும் unclear இருந்தா: "கிளியரா சொல்ல முடியல சார்... அப்புறம் ட்ரை பண்றேன்." சொல்லி முடிங்க.
+## [CURRENT ORDER DETAILS]
 
-Strict constraints:
-- ஆர்டர் confirmation மட்டும் பேசுங்கள் — extra discussion வேண்டாம்.
-- எப்போதும் polite, professional, patient-ஆ இருங்கள்.
-- மெதுவா, தெளிவா, human-like pauses-ஓடு பேசுங்கள் — குறிப்பா order details மற்றும் confirmation-ல.
-- Literary / செந்தமிழ் use பண்ணாதீர்கள்.
-- Decision final ஆனவுடன் call quickly முடிங்க.
+- Order ID: {order['order_id']}
+- Vendor: {order['vendor_name']}
+- Company: {order['company_name']}
+- Items: {items_summary}
+- Total: {total_tamil} ரூபாய்
 
-Call முடிஞ்சவுடன் backend-க்கு exact இதுல ஒன்று மட்டும் output பண்ணுங்கள் — வேற எதுவும் வேண்டாம்:
+## [CALL FLOW]
+
+You have already started the call with the opening greeting informing the vendor about the order.
+Now wait for the vendor's response and follow this flow:
+
+### If Vendor Clearly ACCEPTS (ஓகே, சரி, accept, பண்றேன், etc.):
+Ask one confirmation: "சரி சார்… confirm பண்ணுறேன்… இந்த ஆர்டர் accept தானே?"
+If confirmed again: "சரி சார்… ஆர்டர் accept ஆயிடுச்சு… தேங்க்ஸ்!" → End call.
+
+### If Vendor Clearly REJECTS (முடியாது, reject, வேண்டாம், etc.):
+Ask one confirmation: "சரி சார்… இந்த ஆர்டர் reject தானே?"
+If confirmed again: "ஓகே சார்… ஆர்டர் reject ஆயிடுச்சு… தகவல் சொன்னதுக்கு தேங்க்ஸ்." → End call.
+
+### If Vendor Asks to REPEAT the Order (மறுபடி சொல்லுங்க, repeat, என்ன order, details சொல்லுங்க, etc.):
+Repeat the order details clearly:
+"சரி சார்… Order ID {order['order_id']}… {items_summary}… டோட்டல் {total_tamil} ரூபாய்… இத accept பண்றீங்களா… இல்ல reject பண்றீங்களா?"
+
+### If Vendor Says BUSY / Call Later:
+Say: "ஓகே சார்… அப்புறம் கால் பண்றேன்." → Mark as callback and end call.
+
+### If Response is Unclear:
+Say: "சாரி… கிளியரா சொல்ல முடியுமா?… accept ஆ… இல்ல reject ஆ?"
+If still unclear after one retry: "சரி சார்… கிளியரா புரியல… அப்புறம் ட்ரை பண்றேன்." → End call.
+
+### Silence Handling:
+If silence for a few seconds: "ஹலோ… இருக்கீங்களா?… இந்த ஆர்டர் accept பண்றீங்களா… இல்ல reject பண்றீங்களா?"
+If no response after prompt → end call politely.
+
+## [IMPORTANT RULES]
+
+- Ask only one decision question at a time.
+- Do not repeat full order details during accept/reject confirmation. But if the vendor asks to repeat the order, repeat it.
+- Once final decision is confirmed → end quickly.
+- Stay polite and natural always.
+- Do not argue. Do not add extra information. Do not output internal reasoning.
+
+## [BACKEND OUTPUT — STRICT FORMAT]
+
+After the call ends, output ONLY ONE of the following exactly:
 ACCEPTED
 REJECTED
 CALLBACK_REQUESTED
 NO_RESPONSE
 UNCLEAR_RESPONSE
 
-வாங்க... உங்கள் அழகான Tamil voice-ல vendors-ஐ happy ஆக்கி order confirm பண்ணுங்கள்!"""
+Do not output anything else."""
