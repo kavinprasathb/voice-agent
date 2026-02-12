@@ -54,7 +54,7 @@ gcloud run deploy voice-agent \
 curl -X POST https://your-service-url/call \
   -H "Content-Type: application/json" \
   -d '{
-    "phone_number": "918072293726",
+    "phone_number": "91+phone number",
     "vendor_name": "Kavin",
     "company_name": "Keeggi",
     "order_id": "ORD-2024-7891",
@@ -69,7 +69,7 @@ curl -X POST https://your-service-url/call \
 ```json
 {
   "status": "ok",
-  "message": "Call initiated to 918072293726",
+  "message": "Call initiated to 91+your number",
   "call_sid": "abc123...",
   "order_id": "ORD-2024-7891"
 }
