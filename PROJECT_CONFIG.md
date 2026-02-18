@@ -32,7 +32,10 @@ gcloud run deploy voice-agent \
   --project voice-agent-order-confirm \
   --allow-unauthenticated \
   --memory 512Mi \
-  --timeout 300
+  --timeout 300 \
+  --concurrency 1 \
+  --max-instances 10 \
+  --no-session-affinity
 ```
 
 ---

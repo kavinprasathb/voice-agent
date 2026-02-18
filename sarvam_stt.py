@@ -14,6 +14,7 @@ class SarvamSTT:
     """Streaming Speech-to-Text client for Sarvam AI (Saaras v3)."""
 
     MAX_RECONNECT = 3
+    MAX_CONNECT_RETRIES = 3
 
     def __init__(self, on_transcript: Callable, on_log: Callable = None, on_vad: Callable = None):
         self.on_transcript = on_transcript
@@ -45,22 +46,28 @@ class SarvamSTT:
         )
         headers = {"Api-Subscription-Key": config.SARVAM_API_KEY}
 
-        try:
-            self._log(f"Connecting to {config.SARVAM_STT_WS} (model={config.STT_MODEL})...")
-            self.ws = await websockets.connect(
-                config.SARVAM_STT_WS + params,
-                additional_headers=headers,
-                ping_interval=20,
-                ping_timeout=10,
-            )
-            self._connected = True
-            self._chunks_sent = 0
-            self._reconnect_attempts = 0
-            self._log("Connected OK (Saaras v3 + VAD)")
-            self._listen_task = asyncio.create_task(self._listen())
-        except Exception as e:
-            self._log(f"Connect FAILED: {e}")
-            self._connected = False
+        for attempt in range(self.MAX_CONNECT_RETRIES):
+            try:
+                self._log(f"Connecting to {config.SARVAM_STT_WS} (model={config.STT_MODEL})...")
+                self.ws = await websockets.connect(
+                    config.SARVAM_STT_WS + params,
+                    additional_headers=headers,
+                    ping_interval=20,
+                    ping_timeout=10,
+                )
+                self._connected = True
+                self._chunks_sent = 0
+                self._reconnect_attempts = 0
+                self._log("Connected OK (Saaras v3 + VAD)")
+                self._listen_task = asyncio.create_task(self._listen())
+                return
+            except Exception as e:
+                if attempt < self.MAX_CONNECT_RETRIES - 1:
+                    self._log(f"Connect failed (attempt {attempt + 1}/{self.MAX_CONNECT_RETRIES}), retrying in 1s: {e}")
+                    await asyncio.sleep(1)
+                else:
+                    self._log(f"Connect FAILED after {self.MAX_CONNECT_RETRIES} attempts: {e}")
+                    self._connected = False
 
     async def send_audio(self, audio_base64: str):
         """Send base64-encoded PCM audio chunk to STT."""

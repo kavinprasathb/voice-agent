@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 class SarvamTTS:
     """Streaming Text-to-Speech client for Sarvam AI."""
 
+    MAX_CONNECT_RETRIES = 3
+
     def __init__(self, on_audio: Callable, on_log: Callable = None, on_done: Callable = None,
                  codec: str = None, sample_rate: int = None):
         self.on_audio = on_audio
@@ -39,35 +41,41 @@ class SarvamTTS:
         params = f"?model={config.TTS_MODEL}&send_completion_event=true"
         headers = {"Api-Subscription-Key": config.SARVAM_API_KEY}
 
-        try:
-            self.ws = await websockets.connect(
-                config.SARVAM_TTS_WS + params,
-                additional_headers=headers,
-                ping_interval=20,
-                ping_timeout=10,
-            )
+        for attempt in range(self.MAX_CONNECT_RETRIES):
+            try:
+                self.ws = await websockets.connect(
+                    config.SARVAM_TTS_WS + params,
+                    additional_headers=headers,
+                    ping_interval=20,
+                    ping_timeout=10,
+                )
 
-            await self.ws.send(json.dumps({
-                "type": "config",
-                "data": {
-                    "speaker": config.SPEAKER,
-                    "target_language_code": config.LANGUAGE,
-                    "output_audio_codec": self._codec,
-                    "speech_sample_rate": str(self._sample_rate),
-                    "pace": config.TTS_PACE,
-                    "enable_preprocessing": True,
-                    "model": config.TTS_MODEL,
-                    "min_buffer_size": config.TTS_MIN_BUFFER,
-                    "max_chunk_length": config.TTS_MAX_CHUNK,
-                }
-            }))
+                await self.ws.send(json.dumps({
+                    "type": "config",
+                    "data": {
+                        "speaker": config.SPEAKER,
+                        "target_language_code": config.LANGUAGE,
+                        "output_audio_codec": self._codec,
+                        "speech_sample_rate": str(self._sample_rate),
+                        "pace": config.TTS_PACE,
+                        "enable_preprocessing": True,
+                        "model": config.TTS_MODEL,
+                        "min_buffer_size": config.TTS_MIN_BUFFER,
+                        "max_chunk_length": config.TTS_MAX_CHUNK,
+                    }
+                }))
 
-            self._connected = True
-            self._log("Connected to Sarvam TTS")
-            self._listen_task = asyncio.create_task(self._listen())
-        except Exception as e:
-            self._log(f"Failed to connect: {e}")
-            self._connected = False
+                self._connected = True
+                self._log("Connected to Sarvam TTS")
+                self._listen_task = asyncio.create_task(self._listen())
+                return
+            except Exception as e:
+                if attempt < self.MAX_CONNECT_RETRIES - 1:
+                    self._log(f"Connect failed (attempt {attempt + 1}/{self.MAX_CONNECT_RETRIES}), retrying in 1s: {e}")
+                    await asyncio.sleep(1)
+                else:
+                    self._log(f"Connect FAILED after {self.MAX_CONNECT_RETRIES} attempts: {e}")
+                    self._connected = False
 
     async def speak(self, text: str):
         """Convert text to speech."""
