@@ -28,11 +28,11 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 # Audio settings
 SAMPLE_RATE = 8000
 LANGUAGE = "ta-IN"
-SPEAKER = "shubh"
+SPEAKER = "advait"
 STT_MODEL = "saaras:v3"
 TTS_MODEL = "bulbul:v3"
 TTS_SAMPLE_RATE = 22050
-TTS_PACE = 0.95
+TTS_PACE = 0.91
 TTS_CODEC = "mp3"
 TTS_CODEC_TELEPHONY = "linear16"
 TTS_SAMPLE_RATE_TELEPHONY = 8000
