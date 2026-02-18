@@ -53,15 +53,13 @@ class SarvamTTS:
                 await self.ws.send(json.dumps({
                     "type": "config",
                     "data": {
-                        "speaker": config.SPEAKER,
                         "target_language_code": config.LANGUAGE,
-                        "output_audio_codec": self._codec,
-                        "speech_sample_rate": str(self._sample_rate),
-                        "pace": config.TTS_PACE,
-                        "enable_preprocessing": True,
+                        "speaker": config.SPEAKER,
                         "model": config.TTS_MODEL,
-                        "min_buffer_size": config.TTS_MIN_BUFFER,
-                        "max_chunk_length": config.TTS_MAX_CHUNK,
+                        "pace": config.TTS_PACE,
+                        "speech_sample_rate": self._sample_rate,
+                        "output_audio_codec": self._codec,
+                        "enable_preprocessing": True,
                     }
                 }))
 
