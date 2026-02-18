@@ -67,8 +67,10 @@ class VoiceAgent:
         # Terminal status values that end the call
         self._terminal_statuses = [
             "ACCEPTED", "REJECTED", "CALLBACK_REQUESTED",
-            "NO_RESPONSE", "UNCLEAR_RESPONSE",
+            "NO_RESPONSE",
         ]
+        self._unclear_count = 0
+        self._max_unclear_before_end = 3
         self._rejection_reason = ""
         self._rejection_pending = False
 
@@ -278,7 +280,19 @@ class VoiceAgent:
             if speak_text:
                 await self._speak(speak_text)
 
-            # Check if the status indicates call is ending
+            # Track UNCLEAR_RESPONSE — only end call after repeated failures
+            if "UNCLEAR" in status.upper():
+                self._unclear_count += 1
+                await self._send_log(f"Unclear response ({self._unclear_count}/{self._max_unclear_before_end})")
+                if self._unclear_count >= self._max_unclear_before_end:
+                    await self._send_webhook("UNCLEAR_RESPONSE")
+                    await self._initiate_end_confirmation("UNCLEAR_RESPONSE")
+                    return
+                # Otherwise let the agent keep trying — don't end call
+                return
+            else:
+                self._unclear_count = 0  # Reset on any clear response
+
             terminal = self._extract_terminal_status(status)
 
             if terminal:
