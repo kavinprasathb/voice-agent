@@ -5,6 +5,7 @@ from typing import List, Optional
 
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from google.cloud import firestore
 from pydantic import BaseModel
 
 import config
@@ -21,8 +22,9 @@ app = FastAPI(title="Voice Agent - Order Confirmation")
 # Active call sessions
 sessions: dict[str, VoiceAgent] = {}
 
-# Pending orders waiting for Exotel WebSocket callback (keyed by normalized phone number)
-pending_orders: dict[str, dict] = {}
+# Firestore client for shared pending orders across container instances
+db = firestore.Client()
+PENDING_ORDERS_COLLECTION = "pending_orders"
 
 
 def _normalize_phone(phone: str) -> str:
@@ -64,10 +66,10 @@ async def trigger_call(req: CallRequest):
         "items": [{"name": i.name, "qty": i.qty, "price": i.price} for i in req.items],
     }
 
-    # Store for WebSocket pickup (keyed by normalized phone)
+    # Store in Firestore for cross-container WebSocket pickup
     norm_phone = _normalize_phone(phone)
-    pending_orders[norm_phone] = order_data
-    logger.info(f"Stored pending order for {norm_phone}: {req.order_id}")
+    db.collection(PENDING_ORDERS_COLLECTION).document(norm_phone).set(order_data)
+    logger.info(f"Stored pending order in Firestore for {norm_phone}: {req.order_id}")
 
     # Ensure phone has country code for Exotel
     exotel_phone = phone if phone.startswith("91") else f"91{phone}"
@@ -97,10 +99,10 @@ async def trigger_call(req: CallRequest):
                 }
             else:
                 # Clean up pending order on failure
-                pending_orders.pop(norm_phone, None)
+                db.collection(PENDING_ORDERS_COLLECTION).document(norm_phone).delete()
                 return {"status": "error", "code": resp.status_code, "detail": resp.text[:300]}
     except Exception as e:
-        pending_orders.pop(norm_phone, None)
+        db.collection(PENDING_ORDERS_COLLECTION).document(norm_phone).delete()
         logger.error(f"Failed to trigger call: {e}")
         return {"status": "error", "detail": str(e)}
 
@@ -136,15 +138,18 @@ async def exotel_websocket(ws: WebSocket):
                     f"| format={media_format} | stream={stream_sid}"
                 )
 
-                # Look up pending order by phone number
+                # Look up pending order from Firestore (shared across containers)
                 order_data = None
                 if from_number:
                     norm = _normalize_phone(from_number)
-                    order_data = pending_orders.pop(norm, None)
-                    if order_data:
-                        logger.info(f"Found pending order for {norm}: {order_data['order_id']}")
+                    doc_ref = db.collection(PENDING_ORDERS_COLLECTION).document(norm)
+                    doc = doc_ref.get()
+                    if doc.exists:
+                        order_data = doc.to_dict()
+                        doc_ref.delete()
+                        logger.info(f"Found pending order in Firestore for {norm}: {order_data['order_id']}")
                     else:
-                        logger.info(f"No pending order for {norm}, using default")
+                        logger.info(f"No pending order in Firestore for {norm}, using default")
 
                 agent = VoiceAgent(
                     exotel_ws=ws,
