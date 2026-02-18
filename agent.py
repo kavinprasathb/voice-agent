@@ -1,6 +1,8 @@
 import asyncio
 import json
 import logging
+import random
+import re
 from typing import Optional
 
 import httpx
@@ -17,10 +19,12 @@ logger = logging.getLogger(__name__)
 class VoiceAgent:
     """Orchestrates a single call session: Exotel <-> STT <-> LLM <-> TTS."""
 
-    # Echo suppression: buffer after TTS finishes to account for telephony round-trip latency
-    ECHO_BUFFER_MS = 2500
-    # Server-side flush: if no audio sent to STT for this long, flush
+    ECHO_BUFFER_MS = 500
     FLUSH_AFTER_MS = 2000
+    ECHO_WORD_OVERLAP_THRESHOLD = 0.5
+    ECHO_MIN_WORDS = 4
+
+    MIN_TTS_DURATION_FOR_SILENCE_TIMEOUT = 1.2  # seconds
 
     def __init__(self, exotel_ws: WebSocket, stream_sid: str, call_sid: str, order_data: Optional[dict] = None):
         self.exotel_ws = exotel_ws
@@ -36,29 +40,59 @@ class VoiceAgent:
         self._audio_chunks_received = 0
         self._audio_chunks_sent_to_stt = 0
         self._call_ended = False
+        self._webhook_sent = False
 
         # Echo suppression tracking
-        self._tts_last_finished = 0  # timestamp when TTS last finished speaking
+        self._tts_last_finished = 0  # timestamp when TTS last finished generating
         self._last_audio_sent_time = 0  # timestamp of last audio chunk sent to STT
         self._flush_task: Optional[asyncio.Task] = None
 
         # Track last agent response for echo detection
         self._last_agent_text = ""
 
-        # Track TTS audio duration for accurate silence timeout
+        # Queued transcript: saved when _processing is True, processed after current LLM finishes
+        self._queued_transcript: Optional[str] = None
+
+        # Track TTS audio duration for silence timeout
         self._tts_audio_bytes = 0  # total audio bytes for current utterance
         self._tts_speak_start = 0.0  # when speak() was called
+        self._remaining_playback_sec = 0.0  # estimated remaining playback time
 
         # Silence timeout: re-prompt if no user response
         self._silence_timeout_task: Optional[asyncio.Task] = None
-        self._silence_timeout_sec = 10  # seconds to wait after audio finishes playing
+        self._silence_timeout_sec = 7  # seconds to wait after audio finishes playing
         self._silence_prompts_sent = 0  # track how many silence prompts we've sent
         self._max_silence_prompts = 2  # max re-prompts before giving up
 
-        # Final status keywords the LLM outputs
-        self._status_keywords = [
+        # Terminal status values that end the call
+        self._terminal_statuses = [
             "ACCEPTED", "REJECTED", "CALLBACK_REQUESTED",
             "NO_RESPONSE", "UNCLEAR_RESPONSE",
+        ]
+        self._rejection_reason = ""
+        self._rejection_pending = False
+
+        self._end_confirmation_pending = False
+        self._end_confirmation_status = ""
+        self._end_confirm_keywords = [
+            "சரி", "ஓகே", "okay", "ok", "yes", "bye", "போதும்",
+            "இல்ல", "வேணாம்", "இல்லை", "நன்றி", "thanks",
+            "தேங்க்ஸ்", "பை", "cut", "கட்", "முடிச்சுடு", "கட் பண்ணு",
+        ]
+
+        self._acceptance_keywords = [
+            "ஓகே", "ஓகே தான்", "ஓகேதான்", "சரி", "சரிங்க", "சரி தான்",
+            "ஆமா", "ஆமாங்க", "okay", "ok", "yes", "accept", "ready",
+            "எடுத்துக்கலாம்", "எடுத்துக்குறேன்", "ஏத்துக்குறேன்",
+            "ஏத்துக்கிறேன்", "வாங்கிக்கலாம்", "அக்செப்ட்",
+            "ரெடி", "கொடுங்க", "வாங்கலாம்", "கன்ஃபர்ம்", "confirm",
+            "போடலாம்", "எடுத்துக்கிறேன்",
+        ]
+        self._acceptance_closings = [
+            "சரிங்க, ஆர்டர் கன்ஃபர்ம் ஆயிடுச்சு. தேங்க்ஸ்!",
+            "ஓகே, ஆர்டர் ஏத்துக்கிட்டோம். Thanks!",
+            "சரி, accepted ஆயிடுச்சு. Bye!",
+            "நல்லது, confirm பண்ணிட்டேன். வணக்கம்!",
         ]
 
     async def _send_log(self, msg: str):
@@ -115,8 +149,8 @@ class VoiceAgent:
         if self._audio_chunks_received == 1:
             await self._send_log(f"Receiving mic audio... (STT connected={self.stt._connected if self.stt else 'N/A'})")
 
-        # ECHO SUPPRESSION: Don't send audio to STT while agent is speaking
-        # or for ECHO_BUFFER_MS after agent finishes speaking
+        # ECHO SUPPRESSION: Block audio only during TTS generation + short buffer.
+        # Echo during remaining phone playback is caught at transcript level instead.
         if self.tts and self.tts.is_speaking:
             return
         if self._tts_last_finished > 0 and (now - self._tts_last_finished) < self.ECHO_BUFFER_MS:
@@ -160,8 +194,22 @@ class VoiceAgent:
         if self.stt:
             await self.stt.flush()
 
-    async def handle_dtmf(self, digit: str):
-        await self._send_log(f"DTMF: {digit}")
+    def _is_echo(self, text: str) -> bool:
+        """Detect if a transcript is the agent's own voice echoed back.
+
+        Short responses (< ECHO_MIN_WORDS) are never treated as echo,
+        since real user replies like "ஓகே" should always pass through.
+        For longer transcripts, check word overlap with the last agent utterance.
+        """
+        if not self._last_agent_text:
+            return False
+        words = text.split()
+        if len(words) < self.ECHO_MIN_WORDS:
+            return False  # Short responses are never echo
+        text_words = set(w.lower() for w in words)
+        agent_words = set(w.lower() for w in self._last_agent_text.split())
+        overlap = len(text_words & agent_words) / len(text_words)
+        return overlap >= self.ECHO_WORD_OVERLAP_THRESHOLD
 
     async def _on_transcript(self, text: str, is_final: bool):
         """Called when STT produces a transcript."""
@@ -176,114 +224,235 @@ class VoiceAgent:
             await self._send_log(f"Ignored short transcript: '{text}'")
             return
 
-        await self._send_log(f"You said: {text}")
-
-        # Don't process while agent is speaking (echo prevention)
-        if self.tts and self.tts.is_speaking:
-            await self._send_log("Ignoring — agent is still speaking")
+        # Echo detection: if transcript is a long phrase that overlaps heavily with agent's last speech, ignore
+        if self._is_echo(text):
+            await self._send_log(f"Echo detected, ignoring: '{text}'")
             return
 
-        # Echo detection: reject if transcript matches agent's own recent words
-        if self._last_agent_text and len(text) > 5:
-            # Check if significant portion of transcript appears in last agent response
-            text_lower = text.lower()
-            agent_lower = self._last_agent_text.lower()
-            if text_lower in agent_lower or any(
-                word in agent_lower for word in text_lower.split() if len(word) > 4
-            ):
-                await self._send_log(f"Ignoring echo transcript: '{text[:40]}...'")
-                return
+        await self._send_log(f"You said: {text}")
 
         if not is_final:
             return
 
         if self._processing:
-            await self._send_log("Still processing previous message...")
+            # Queue latest transcript instead of dropping — will process after current LLM finishes
+            self._queued_transcript = text
+            await self._send_log(f"Queued transcript (LLM busy): '{text}'")
             return
 
         self._processing = True
         self._silence_prompts_sent = 0  # Reset on real user response
         try:
+            # Handle end confirmation response
+            if self._end_confirmation_pending:
+                if self._is_user_confirming_end(text):
+                    await self._send_log(f"User confirmed call end: '{text}'")
+                    goodbye = random.choice(["சரி, நன்றி. Bye!", "ஓகே, வணக்கம்!"])
+                    self._last_agent_text = goodbye
+                    await self._speak(goodbye)
+                    await self._end_call(self._end_confirmation_status)
+                else:
+                    # User said something else — pass to LLM
+                    await self._send_log(f"User responded during end confirmation: '{text}'")
+                    self._end_confirmation_pending = False
+                    self._end_confirmation_status = ""
+                    # Fall through to normal LLM processing below
+
+            if self._end_confirmation_pending:
+                # Already handled above (confirmed end)
+                return
+
             await self._send_log(f"Thinking...")
             response = await self.llm.chat(text)
-            await self._send_log(f"Agent: {response}")
+            await self._send_log(f"Agent raw: {response}")
+
+            # Parse <speak> and <status> tags from LLM response
+            speak_text, status = self._parse_llm_response(response)
+
+            await self._send_log(f"Agent speak: {speak_text} | status: {status}")
 
             # Track for echo detection
-            self._last_agent_text = response
+            self._last_agent_text = speak_text
 
-            # Speak the full response at once (avoids audio gaps)
-            await self._speak(response)
+            # Speak only the <speak> content (not status tags)
+            if speak_text:
+                await self._speak(speak_text)
 
-            # Check if the response indicates call is ending
-            status = self._detect_call_ending(response)
-            if status:
-                await self._send_webhook(status)
-                await self._end_call(status)
+            # Check if the status indicates call is ending
+            terminal = self._extract_terminal_status(status)
+
+            if terminal:
+                if terminal == "REJECTED" and self._speak_is_question(speak_text):
+                    self._rejection_pending = True
+                    await self._send_log("Rejection pending — waiting for reason")
+                elif self._rejection_pending and terminal == "REJECTED":
+                    # Append any new reason piece
+                    new_reason = self._extract_reason_from_status(status) or text.strip()
+                    if new_reason and new_reason not in self._rejection_reason:
+                        if self._rejection_reason:
+                            self._rejection_reason += " | " + new_reason
+                        else:
+                            self._rejection_reason = new_reason
+                    await self._send_webhook("REJECTED")
+                    await self._initiate_end_confirmation("REJECTED")
+                else:
+                    await self._send_webhook(terminal)
+                    await self._initiate_end_confirmation(terminal)
+            elif self._rejection_pending:
+                # Vendor gave reason but LLM didn't set terminal
+                new_reason = text.strip()
+                if new_reason:
+                    if self._rejection_reason:
+                        self._rejection_reason += " | " + new_reason
+                    else:
+                        self._rejection_reason = new_reason
+                await self._send_webhook("REJECTED")
+                await self._initiate_end_confirmation("REJECTED")
             # Silence timeout will restart when TTS finishes (in _on_tts_done)
         except Exception as e:
             await self._send_log(f"Error: {e}")
         finally:
             self._processing = False
+            # Process queued transcript if one arrived while LLM was busy
+            if self._queued_transcript and not self._call_ended:
+                queued = self._queued_transcript
+                self._queued_transcript = None
+                await self._send_log(f"Processing queued transcript: '{queued}'")
+                await self._on_transcript(queued, True)
 
-    def _detect_call_ending(self, response: str) -> Optional[str]:
-        """Detect if the agent's FINAL response indicates the call is ending.
-        Only triggers on confirmed closing lines (with ஆயிடுச்சு + தேங்க்ஸ்),
-        NOT on double-check questions (பண்ணிட்டுமா??).
+    def _is_user_accepting(self, transcript: str) -> bool:
+        """Check if the user's transcript contains clear acceptance words."""
+        lower = transcript.lower().strip()
+        for kw in self._acceptance_keywords:
+            if kw.lower() in lower:
+                return True
+        return False
+
+    def _is_user_confirming_end(self, transcript: str) -> bool:
+        """Check if the user is confirming call end."""
+        lower = transcript.lower().strip()
+        for kw in self._end_confirm_keywords:
+            if kw.lower() in lower:
+                return True
+        return False
+
+    async def _initiate_end_confirmation(self, status: str):
+        """Ask the user before ending the call. Waits for any ongoing TTS to finish first."""
+        self._end_confirmation_pending = True
+        self._end_confirmation_status = status
+        # Wait for current TTS to finish generating
+        while self.tts and self.tts.is_speaking:
+            await asyncio.sleep(0.1)
+        # Wait a bit for phone playback after TTS generation finishes
+        if self._remaining_playback_sec > 0:
+            await asyncio.sleep(self._remaining_playback_sec)
+        # Small buffer so user hears the closing message fully
+        await asyncio.sleep(1)
+        await self._send_log(f"Asking end confirmation for status: {status}")
+        prompt = "சரி, வேற ஏதாவது இருக்கா? இல்லன்னா call cut பண்ணிடலாமா?"
+        self._last_agent_text = prompt
+        await self._speak(prompt)
+
+    def _speak_is_question(self, text: str) -> bool:
+        """Check if the speak text is a question (agent is asking something and should wait)."""
+        if not text:
+            return False
+        question_markers = ["?", "ஏன்", "இல்லையா", "என்ன", "முடியுமா", "சொல்லுங்க"]
+        for marker in question_markers:
+            if marker in text:
+                return True
+        return False
+
+    def _parse_llm_response(self, response: str) -> tuple[str, str]:
+        """Parse <speak> and <status> tags from LLM response.
+        Returns (speak_text, status_text). Falls back to full response if no tags.
         """
-        lower = response.lower()
+        # Extract <speak>...</speak>
+        speak_match = re.search(r'<speak>(.*?)</speak>', response, re.DOTALL)
+        if speak_match:
+            speak_text = speak_match.group(1).strip()
+        else:
+            # Handle missing </speak> — extract everything after <speak>
+            open_match = re.search(r'<speak>(.*)', response, re.DOTALL)
+            speak_text = open_match.group(1).strip() if open_match else ""
 
-        # Skip double-check questions — they contain "?" and are asking, not confirming
-        if "பண்ணிட்டுமா" in lower or "பண்றீங்களா" in lower:
+        # Extract <status>...</status>
+        status_match = re.search(r'<status>(.*?)</status>', response, re.DOTALL)
+        status_text = status_match.group(1).strip() if status_match else ""
+
+        # Fallback: if no <speak> tag found
+        if not speak_text:
+            if status_text:
+                # Has <status> but no <speak> — text before <status> is the speech
+                before_status = re.split(r'<status>', response, maxsplit=1)[0].strip()
+                speak_text = before_status
+            else:
+                # No tags at all — treat entire response as speech
+                speak_text = response.strip()
+                status_text = self._detect_status_fallback(response)
+
+        # Always strip any leftover XML tags from speak text
+        speak_text = re.sub(r'</?(?:speak|status)(?:\s[^>]*)?>.*', '', speak_text, flags=re.DOTALL).strip()
+        speak_text = re.sub(r'</?(?:speak|status)>', '', speak_text).strip()
+
+        return speak_text, status_text
+
+    def _extract_reason_from_status(self, status: str) -> Optional[str]:
+        """Extract rejection reason from status string like 'REJECTED | REASON: ...'"""
+        match = re.search(r'REASON:\s*(.+)', status, re.IGNORECASE)
+        return match.group(1).strip() if match else None
+
+    def _extract_terminal_status(self, status: str) -> Optional[str]:
+        """Check if the status string is a terminal status that ends the call.
+        Handles 'REJECTED | REASON: ...' format.
+        """
+        if not status:
             return None
+        upper = status.upper().strip()
 
-        # Check for exact status keywords first (if LLM outputs them)
-        upper = response.upper().strip()
-        for keyword in self._status_keywords:
-            if keyword in upper:
-                return keyword
+        # Handle REJECTED | REASON: ...
+        if upper.startswith("REJECTED"):
+            reason_match = re.search(r'REASON:\s*(.+)', status, re.IGNORECASE)
+            if reason_match:
+                self._rejection_reason = reason_match.group(1).strip()
+            return "REJECTED"
 
-        # Only match FINAL confirmation lines (ஆயிடுச்சு = "it's done")
-        # These must have both the decision + thanks/closing
-        has_thanks = any(s in lower for s in ["தேங்க்ஸ்", "thanks", "நன்றி"])
-
-        accept_finals = [
-            "accept ஆயிடுச்சு", "அக்செப்ட் ஆயிடுச்சு",
-            "accept பண்ணிட்டாங்க", "accept பண்ணிட்டோம்",
-            "order accepted", "உறுதிப்படுத்தப்பட்டது",
-        ]
-        reject_finals = [
-            "reject ஆயிடுச்சு", "ரிஜெக்ட் ஆயிடுச்சு",
-            "reject பண்ணிட்டாங்க", "reject பண்ணிட்டோம்",
-            "order rejected",
-        ]
-        callback_signals = [
-            "அப்புறம் கால் பண்றேன்", "அப்புறம் ட்ரை பண்றேன்",
-            "அப்புறம் கால்", "later பண்றேன்",
-        ]
-        unclear_signals = [
-            "கிளியரா சொல்ல முடியல", "அப்புறம் ட்ரை",
-        ]
-
-        for signal in accept_finals:
-            if signal in lower and has_thanks:
-                return "ACCEPTED"
-        for signal in reject_finals:
-            if signal in lower and has_thanks:
-                return "REJECTED"
-        for signal in callback_signals:
-            if signal in lower:
-                return "CALLBACK_REQUESTED"
-        for signal in unclear_signals:
-            if signal in lower:
-                return "UNCLEAR_RESPONSE"
+        for terminal in self._terminal_statuses:
+            if terminal in upper:
+                return terminal
 
         return None
 
+    def _detect_status_fallback(self, response: str) -> str:
+        """Fallback: detect status from response text when LLM doesn't use tags."""
+        lower = response.lower()
+
+        # Skip double-check questions
+        if "பண்ணிட்டுமா" in lower or "பண்றீங்களா" in lower or "ஓகே-வா" in lower:
+            return "CONFIRMING"
+
+        upper = response.upper().strip()
+        for keyword in self._terminal_statuses:
+            if keyword in upper:
+                return keyword
+
+        has_thanks = any(s in lower for s in ["தேங்க்ஸ்", "thanks", "நன்றி"])
+        if any(s in lower for s in ["accept ஆயிடுச்சு", "அக்செப்ட் ஆயிடுச்சு"]) and has_thanks:
+            return "ACCEPTED"
+        if any(s in lower for s in ["reject ஆயிடுச்சு", "ரிஜெக்ட் ஆயிடுச்சு"]) and has_thanks:
+            return "REJECTED"
+        if any(s in lower for s in ["அப்புறம் கால் பண்றேன்", "அப்புறம் ட்ரை பண்றேன்"]):
+            return "CALLBACK_REQUESTED"
+        if any(s in lower for s in ["கிளியரா சொல்ல முடியல", "கிளியரா புரியல"]):
+            return "UNCLEAR_RESPONSE"
+
+        return "CONFIRMING"
+
     async def _send_webhook(self, status: str):
         """Send order confirmation result to n8n webhook."""
-        if self._call_ended:
+        if self._webhook_sent:
             return
-        self._call_ended = True
+        self._webhook_sent = True
 
         payload = {
             "order_id": self.order_data["order_id"],
@@ -293,6 +462,8 @@ class VoiceAgent:
             "status": status,
             "call_sid": self.call_sid,
         }
+        if status == "REJECTED" and self._rejection_reason:
+            payload["rejection_reason"] = self._rejection_reason
 
         await self._send_log(f"Sending webhook: Status={status}")
         logger.info(f"Sending webhook to {config.WEBHOOK_URL}: {payload}")
@@ -308,6 +479,7 @@ class VoiceAgent:
 
     async def _end_call(self, status: str):
         """Notify the browser of the result and hang up the Exotel call."""
+        self._call_ended = True
         status_labels = {
             "ACCEPTED": "Order Accepted",
             "REJECTED": "Order Rejected",
@@ -352,32 +524,32 @@ class VoiceAgent:
             logger.error(f"WebSocket close error: {e}")
 
     async def _on_tts_done(self):
-        """Called when TTS finishes generating — wait for playback then start silence timeout."""
+        """Called when TTS finishes generating — NON-BLOCKING.
+
+        Must not sleep here because this runs inside the TTS listener loop.
+        Sleeping would block audio chunk processing and cause race conditions.
+
+        Echo suppression strategy:
+        - Audio-level: mic is blocked during TTS generation + 500ms buffer (handled in handle_media)
+        - Transcript-level: any remaining echo is caught by _is_echo() in _on_transcript
+        """
         now = asyncio.get_event_loop().time()
         self._tts_last_finished = now * 1000
-
-        # Cancel any existing silence timeout IMMEDIATELY (before sleep)
-        # This prevents an earlier timeout (e.g. from "ஹலோ") from firing
-        # while we wait for this utterance's playback to finish
         self._cancel_silence_timeout()
 
-        # Estimate how long the audio takes to play vs how long TTS took to generate
-        # Audio is PCM 16-bit at telephony sample rate (8000 Hz) → 16000 bytes/sec
         sample_rate = config.TTS_SAMPLE_RATE_TELEPHONY if not self.call_sid.startswith("test-") else config.TTS_SAMPLE_RATE
-        playback_sec = self._tts_audio_bytes / (sample_rate * 2) if self._tts_audio_bytes > 0 else 0
+        playback_sec = self._tts_audio_bytes / (sample_rate * 2) if self._tts_audio_bytes > 0 else 0.0
+
+        if playback_sec < self.MIN_TTS_DURATION_FOR_SILENCE_TIMEOUT:
+            await self._send_log(f"Short TTS ({playback_sec:.1f}s) — skipping silence timeout")
+            return
+
         generation_sec = now - self._tts_speak_start if self._tts_speak_start > 0 else 0
-        remaining_playback = max(0, playback_sec - generation_sec)
+        self._remaining_playback_sec = max(0, playback_sec - generation_sec)
 
         await self._send_log(
-            f"TTS done — audio={playback_sec:.1f}s, generated in {generation_sec:.1f}s, "
-            f"playback remaining={remaining_playback:.1f}s"
+            f"TTS done — playback ≈ {playback_sec:.1f}s gen, remaining ≈ {self._remaining_playback_sec:.1f}s"
         )
-
-        # Wait for audio to finish playing on the phone, then start silence timeout
-        if remaining_playback > 0:
-            await asyncio.sleep(remaining_playback)
-            # Update echo buffer timestamp to after playback finishes
-            self._tts_last_finished = asyncio.get_event_loop().time() * 1000
 
         if not self._call_ended and not self._processing:
             self._start_silence_timeout()
@@ -395,26 +567,48 @@ class VoiceAgent:
             self._silence_timeout_task = None
 
     async def _silence_timeout_handler(self):
-        """Wait for silence_timeout_sec, then re-prompt or end call."""
+        """Wait for remaining playback + silence_timeout_sec, then re-prompt or end call."""
         try:
-            await asyncio.sleep(self._silence_timeout_sec)
+            # Wait for audio to finish playing on the phone, THEN wait for silence
+            total_wait = self._remaining_playback_sec + self._silence_timeout_sec
+            await asyncio.sleep(total_wait)
+            # Check end confirmation FIRST — webhook already sent
+            # but call is still open waiting for user to confirm end
+            if self._end_confirmation_pending:
+                if self._processing:
+                    return
+                await self._send_log("Silence after end confirmation — ending call")
+                await self._end_call(self._end_confirmation_status)
+                return
+
             if self._call_ended or self._processing:
+                return
+
+            # If rejection is pending and vendor stayed silent, end call now
+            if self._rejection_pending:
+                await self._send_log("Silence after rejection question — ending call with REJECTED")
+                await self._send_webhook("REJECTED")
+                await self._initiate_end_confirmation("REJECTED")
                 return
 
             self._silence_prompts_sent += 1
             if self._silence_prompts_sent > self._max_silence_prompts:
                 # Too many unanswered prompts — end call
                 await self._send_log("No response after multiple prompts — ending call")
-                response = "சரி சார்... அப்புறம் ட்ரை பண்றேன்."
+                response = "சரி... அப்புறம் ட்ரை பண்றேன்."
                 self._last_agent_text = response
                 await self._speak(response)
                 await self._send_webhook("NO_RESPONSE")
                 await self._end_call("NO_RESPONSE")
                 return
 
-            # Re-prompt the vendor
+            # Re-prompt the vendor with colloquial Tamil
             await self._send_log(f"Silence timeout — prompting vendor (attempt {self._silence_prompts_sent})")
-            prompt = "ஹலோ... இருக்கீங்களா?... ஆர்டர் அக்செப்ட் பண்றீங்களா... இல்ல ரிஜெக்ட் பண்றீங்களா?"
+            prompts = [
+                "ஹலோ... ஆர்டர் ஓகே-வா? இருக்கீங்களா?",
+                "ஹலோ... இருக்கீங்களா? ஆர்டர் confirm பண்ணலாமா?",
+            ]
+            prompt = prompts[min(self._silence_prompts_sent - 1, len(prompts) - 1)]
             self._last_agent_text = prompt
             await self._speak(prompt)
             # Next silence timeout will start when TTS finishes (in _on_tts_done)
@@ -424,9 +618,9 @@ class VoiceAgent:
     async def _on_vad(self, signal: str):
         """Handle VAD events from Saaras v3 STT."""
         if signal == "speech_start":
-            await self._send_log("VAD: user speech detected")
-            # User is speaking — cancel silence timeout
+            # Cancel silence timeout IMMEDIATELY — before any awaits
             self._cancel_silence_timeout()
+            await self._send_log("VAD: user speech detected")
         elif signal == "speech_end":
             await self._send_log("VAD: user speech ended — flushing STT")
             if self.stt and self.stt._connected and not self._call_ended:
@@ -434,6 +628,7 @@ class VoiceAgent:
 
     async def _speak(self, text: str):
         if self.tts:
+            self._cancel_silence_timeout()
             self._tts_audio_bytes = 0
             self._tts_speak_start = asyncio.get_event_loop().time()
             await self.tts.speak(text)
@@ -451,18 +646,6 @@ class VoiceAgent:
             })
         except Exception as e:
             logger.error(f"Error sending audio: {e}")
-
-    async def _interrupt(self):
-        await self._send_log("Interrupted by customer")
-        if self.tts:
-            await self.tts.stop()
-        try:
-            await self.exotel_ws.send_json({
-                "event": "clear",
-                "stream_sid": self.stream_sid,
-            })
-        except Exception:
-            pass
 
     async def stop(self):
         logger.info(f"Agent stopping for call {self.call_sid}")
