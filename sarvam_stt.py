@@ -16,10 +16,12 @@ class SarvamSTT:
     MAX_RECONNECT = 3
     MAX_CONNECT_RETRIES = 3
 
-    def __init__(self, on_transcript: Callable, on_log: Callable = None, on_vad: Callable = None):
+    def __init__(self, on_transcript: Callable, on_log: Callable = None, on_vad: Callable = None,
+                 api_key: str = None):
         self.on_transcript = on_transcript
         self.on_log = on_log
         self.on_vad = on_vad  # Called with ("speech_start" | "speech_end")
+        self._api_key = api_key or config.SARVAM_API_KEY
         self.ws = None
         self._listen_task: Optional[asyncio.Task] = None
         self._connected = False
@@ -44,7 +46,7 @@ class SarvamSTT:
             f"&high_vad_sensitivity=true"
             f"&flush_signal=true"
         )
-        headers = {"Api-Subscription-Key": config.SARVAM_API_KEY}
+        headers = {"Api-Subscription-Key": self._api_key}
 
         for attempt in range(self.MAX_CONNECT_RETRIES):
             try:

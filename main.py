@@ -5,11 +5,18 @@ from typing import List, Optional
 
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from google.cloud import firestore
 from pydantic import BaseModel
+
+try:
+    from google.cloud import firestore
+    db = firestore.Client()
+except Exception:
+    firestore = None
+    db = None
 
 import config
 from agent import VoiceAgent
+from sarvam_key_pool import SarvamKeyPool
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,9 +29,21 @@ app = FastAPI(title="Voice Agent - Order Confirmation")
 # Active call sessions
 sessions: dict[str, VoiceAgent] = {}
 
+# Sarvam API key pool for concurrent call support
+key_pool: Optional[SarvamKeyPool] = None
+
 # Firestore client for shared pending orders across container instances
-db = firestore.Client()
 PENDING_ORDERS_COLLECTION = "pending_orders"
+
+
+@app.on_event("startup")
+async def startup():
+    global key_pool
+    if config.SARVAM_API_KEYS:
+        key_pool = SarvamKeyPool(config.SARVAM_API_KEYS)
+        logger.info(f"Key pool ready: {key_pool.status()}")
+    else:
+        logger.warning("No SARVAM_API_KEYS configured — calls will fail")
 
 
 def _normalize_phone(phone: str) -> str:
@@ -35,13 +54,17 @@ def _normalize_phone(phone: str) -> str:
 
 @app.get("/")
 async def health():
-    return {"status": "ok", "active_calls": len(sessions)}
+    result = {"status": "ok", "active_calls": len(sessions)}
+    if key_pool:
+        result["key_pool"] = key_pool.status()
+    return result
 
 
 class OrderItem(BaseModel):
     name: str
     qty: int
     price: float
+    variation: Optional[str] = None
 
 
 class CallRequest(BaseModel):
@@ -58,18 +81,30 @@ async def trigger_call(req: CallRequest):
     phone = req.phone_number
     logger.info(f"Triggering call to {phone} | order={req.order_id} vendor={req.vendor_name}")
 
+    # Reject early if all keys are in use and queue is full
+    if key_pool:
+        pool_st = key_pool.status()
+        if pool_st["available"] == 0 and pool_st["waiting"] >= key_pool.MAX_QUEUE_WAIT:
+            logger.warning(f"Rejecting call — key pool exhausted: {pool_st}")
+            return {
+                "status": "error",
+                "detail": "All lines busy. Try again shortly.",
+                "key_pool": pool_st,
+            }
+
     # Build order data dict
     order_data = {
         "order_id": req.order_id,
         "vendor_name": req.vendor_name,
         "company_name": req.company_name,
-        "items": [{"name": i.name, "qty": i.qty, "price": i.price} for i in req.items],
+        "items": [{"name": i.name, "qty": i.qty, "price": i.price, "variation": i.variation} for i in req.items],
     }
 
     # Store in Firestore for cross-container WebSocket pickup
     norm_phone = _normalize_phone(phone)
-    db.collection(PENDING_ORDERS_COLLECTION).document(norm_phone).set(order_data)
-    logger.info(f"Stored pending order in Firestore for {norm_phone}: {req.order_id}")
+    if db:
+        db.collection(PENDING_ORDERS_COLLECTION).document(norm_phone).set(order_data)
+        logger.info(f"Stored pending order in Firestore for {norm_phone}: {req.order_id}")
 
     # Ensure phone has country code for Exotel
     exotel_phone = phone if phone.startswith("91") else f"91{phone}"
@@ -99,10 +134,12 @@ async def trigger_call(req: CallRequest):
                 }
             else:
                 # Clean up pending order on failure
-                db.collection(PENDING_ORDERS_COLLECTION).document(norm_phone).delete()
+                if db:
+                    db.collection(PENDING_ORDERS_COLLECTION).document(norm_phone).delete()
                 return {"status": "error", "code": resp.status_code, "detail": resp.text[:300]}
     except Exception as e:
-        db.collection(PENDING_ORDERS_COLLECTION).document(norm_phone).delete()
+        if db:
+            db.collection(PENDING_ORDERS_COLLECTION).document(norm_phone).delete()
         logger.error(f"Failed to trigger call: {e}")
         return {"status": "error", "detail": str(e)}
 
@@ -115,6 +152,14 @@ async def exotel_websocket(ws: WebSocket):
 
     agent = None
     stream_sid = None
+    api_key = None  # Checked-out key for this call
+
+    def release_fn():
+        """Release the API key back to the pool (called by agent or finally block)."""
+        nonlocal api_key
+        if api_key and key_pool:
+            key_pool.release(api_key)
+            api_key = None
 
     try:
         while True:
@@ -138,9 +183,17 @@ async def exotel_websocket(ws: WebSocket):
                     f"| format={media_format} | stream={stream_sid}"
                 )
 
-                # Look up pending order from Firestore (shared across containers)
+                # Checkout an API key from the pool
+                if key_pool:
+                    try:
+                        api_key = await key_pool.checkout(timeout=30)
+                    except (TimeoutError, RuntimeError) as e:
+                        logger.error(f"Key pool checkout failed for {call_sid}: {e}")
+                        break
+
+                # Look up order data: Firestore for real calls, start_data for browser tester
                 order_data = None
-                if from_number:
+                if from_number and db:
                     norm = _normalize_phone(from_number)
                     doc_ref = db.collection(PENDING_ORDERS_COLLECTION).document(norm)
                     doc = doc_ref.get()
@@ -151,11 +204,23 @@ async def exotel_websocket(ws: WebSocket):
                     else:
                         logger.info(f"No pending order in Firestore for {norm}, using default")
 
+                # Browser tester sends order data directly in start event
+                if not order_data and start_data.get("order_id"):
+                    order_data = {
+                        "order_id": start_data.get("order_id", ""),
+                        "vendor_name": start_data.get("vendor_name", ""),
+                        "company_name": start_data.get("company_name", "Keeggi"),
+                        "items": start_data.get("items", []),
+                    }
+                    logger.info(f"Using browser-provided order: {order_data['order_id']}")
+
                 agent = VoiceAgent(
                     exotel_ws=ws,
                     stream_sid=stream_sid,
                     call_sid=call_sid,
                     order_data=order_data,
+                    api_key=api_key,
+                    on_key_release=release_fn,
                 )
                 sessions[stream_sid] = agent
                 await agent.start()
@@ -191,6 +256,8 @@ async def exotel_websocket(ws: WebSocket):
     finally:
         if agent:
             await agent.stop()
+        # Safety-net release if agent didn't release (e.g., agent never created)
+        release_fn()
         if stream_sid and stream_sid in sessions:
             del sessions[stream_sid]
         logger.info("Session cleaned up")

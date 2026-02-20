@@ -3,7 +3,7 @@ import json
 import logging
 import random
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 from starlette.websockets import WebSocket
@@ -26,11 +26,17 @@ class VoiceAgent:
 
     MIN_TTS_DURATION_FOR_SILENCE_TIMEOUT = 1.2  # seconds
 
-    def __init__(self, exotel_ws: WebSocket, stream_sid: str, call_sid: str, order_data: Optional[dict] = None):
+    def __init__(self, exotel_ws: WebSocket, stream_sid: str, call_sid: str,
+                 order_data: Optional[dict] = None,
+                 api_key: str = None, on_key_release: Callable = None):
         self.exotel_ws = exotel_ws
         self.stream_sid = stream_sid
         self.call_sid = call_sid
         self.order_data = order_data or config.DEFAULT_ORDER
+        self._api_key = api_key
+        self._on_key_release = on_key_release
+        self._key_released = False
+        self._greeting_fallback_task: Optional[asyncio.Task] = None
 
         self.stt: Optional[SarvamSTT] = None
         self.tts: Optional[SarvamTTS] = None
@@ -74,13 +80,9 @@ class VoiceAgent:
         self._rejection_reason = ""
         self._rejection_pending = False
 
-        self._end_confirmation_pending = False
-        self._end_confirmation_status = ""
-        self._end_confirm_keywords = [
-            "சரி", "ஓகே", "okay", "ok", "yes", "bye", "போதும்",
-            "இல்ல", "வேணாம்", "இல்லை", "நன்றி", "thanks",
-            "தேங்க்ஸ்", "பை", "cut", "கட்", "முடிச்சுடு", "கட் பண்ணு",
-        ]
+        # Two-phase greeting: intro first, wait for any vendor response, then items
+        self._greeting_phase = 0  # 0=normal, 1=waiting for vendor ack after intro
+        self._intro_ack_event = asyncio.Event()
 
         self._acceptance_keywords = [
             "ஓகே", "ஓகே தான்", "ஓகேதான்", "சரி", "சரிங்க", "சரி தான்",
@@ -112,7 +114,10 @@ class VoiceAgent:
         await self._send_log("Starting voice agent...")
 
         self.llm = SarvamLLM(system_prompt=config.build_system_prompt(self.order_data))
-        self.stt = SarvamSTT(on_transcript=self._on_transcript, on_log=self._send_log, on_vad=self._on_vad)
+        self.stt = SarvamSTT(
+            on_transcript=self._on_transcript, on_log=self._send_log,
+            on_vad=self._on_vad, api_key=self._api_key,
+        )
 
         # Use telephony codec for real Exotel calls, mp3 for browser tester
         is_real_call = not self.call_sid.startswith("test-")
@@ -120,14 +125,24 @@ class VoiceAgent:
             self.tts = SarvamTTS(
                 on_audio=self._on_tts_audio, on_log=self._send_log, on_done=self._on_tts_done,
                 codec=config.TTS_CODEC_TELEPHONY, sample_rate=config.TTS_SAMPLE_RATE_TELEPHONY,
+                api_key=self._api_key,
             )
         else:
             self.tts = SarvamTTS(
                 on_audio=self._on_tts_audio, on_log=self._send_log, on_done=self._on_tts_done,
+                api_key=self._api_key,
             )
 
         await self.stt.connect()
         await self.tts.connect()
+
+        # Graceful failure: if both STT and TTS failed to connect, end call immediately
+        if not self.stt._connected and not self.tts._connected:
+            await self._send_log("FATAL: Both STT and TTS failed to connect — ending call")
+            await self._send_webhook("NO_RESPONSE")
+            self._call_ended = True
+            self._release_key()
+            return
 
         await self._send_log(f"Agent ready for call {self.call_sid}")
 
@@ -136,11 +151,34 @@ class VoiceAgent:
         await self._speak("ஹலோ")
         await asyncio.sleep(1)
 
-        # Send full greeting
-        greeting = config.build_greeting(self.order_data)
-        self._last_agent_text = greeting
-        await self._speak(greeting)
+        # Phase 1: Short intro (name + company + "new order")
+        intro = config.build_greeting_intro(self.order_data)
+        self._last_agent_text = intro
+        self._greeting_phase = 1
+        await self._speak(intro)
+
+        # Wait for TTS to finish generating the intro
+        while self.tts and self.tts.is_speaking:
+            await asyncio.sleep(0.1)
+
+        # Wait for vendor to respond (any response) or timeout after playback + 1.5s
+        wait_time = self._remaining_playback_sec + 1.5
+        try:
+            await asyncio.wait_for(self._intro_ack_event.wait(), timeout=wait_time)
+            await self._send_log("Vendor acknowledged intro — reading items")
+        except asyncio.TimeoutError:
+            await self._send_log("No response to intro — continuing with items")
+
+        self._greeting_phase = 0
+
+        # Phase 2: Read order items + total + "okay?"
+        items_greeting = config.build_greeting_items(self.order_data)
+        self._last_agent_text = items_greeting
+        await self._speak(items_greeting)
         # Silence timeout will start when TTS finishes (in _on_tts_done)
+
+        # Fallback: if _on_tts_done never fires (TTS broken), start silence timeout after 15s
+        self._greeting_fallback_task = asyncio.create_task(self._greeting_fallback_timeout())
 
     async def handle_media(self, payload: str):
         """Handle incoming audio from Exotel — forward to STT with echo suppression."""
@@ -221,6 +259,12 @@ class VoiceAgent:
         if not text:
             return
 
+        # During greeting intro phase, any vendor response means they're listening
+        if self._greeting_phase == 1 and is_final:
+            await self._send_log(f"Vendor response during intro: '{text}'")
+            self._intro_ack_event.set()
+            return
+
         # Ignore very short transcripts (noise/echo artifacts)
         if len(text) < 3:
             await self._send_log(f"Ignored short transcript: '{text}'")
@@ -245,25 +289,6 @@ class VoiceAgent:
         self._processing = True
         self._silence_prompts_sent = 0  # Reset on real user response
         try:
-            # Handle end confirmation response
-            if self._end_confirmation_pending:
-                if self._is_user_confirming_end(text):
-                    await self._send_log(f"User confirmed call end: '{text}'")
-                    goodbye = random.choice(["சரி, நன்றி. Bye!", "ஓகே, வணக்கம்!"])
-                    self._last_agent_text = goodbye
-                    await self._speak(goodbye)
-                    await self._end_call(self._end_confirmation_status)
-                else:
-                    # User said something else — pass to LLM
-                    await self._send_log(f"User responded during end confirmation: '{text}'")
-                    self._end_confirmation_pending = False
-                    self._end_confirmation_status = ""
-                    # Fall through to normal LLM processing below
-
-            if self._end_confirmation_pending:
-                # Already handled above (confirmed end)
-                return
-
             await self._send_log(f"Thinking...")
             response = await self.llm.chat(text)
             await self._send_log(f"Agent raw: {response}")
@@ -286,7 +311,7 @@ class VoiceAgent:
                 await self._send_log(f"Unclear response ({self._unclear_count}/{self._max_unclear_before_end})")
                 if self._unclear_count >= self._max_unclear_before_end:
                     await self._send_webhook("UNCLEAR_RESPONSE")
-                    await self._initiate_end_confirmation("UNCLEAR_RESPONSE")
+                    await self._finish_call("UNCLEAR_RESPONSE")
                     return
                 # Otherwise let the agent keep trying — don't end call
                 return
@@ -308,10 +333,10 @@ class VoiceAgent:
                         else:
                             self._rejection_reason = new_reason
                     await self._send_webhook("REJECTED")
-                    await self._initiate_end_confirmation("REJECTED")
+                    await self._finish_call("REJECTED")
                 else:
                     await self._send_webhook(terminal)
-                    await self._initiate_end_confirmation(terminal)
+                    await self._finish_call(terminal)
             elif self._rejection_pending:
                 # Vendor gave reason but LLM didn't set terminal
                 new_reason = text.strip()
@@ -321,7 +346,7 @@ class VoiceAgent:
                     else:
                         self._rejection_reason = new_reason
                 await self._send_webhook("REJECTED")
-                await self._initiate_end_confirmation("REJECTED")
+                await self._finish_call("REJECTED")
             # Silence timeout will restart when TTS finishes (in _on_tts_done)
         except Exception as e:
             await self._send_log(f"Error: {e}")
@@ -342,30 +367,12 @@ class VoiceAgent:
                 return True
         return False
 
-    def _is_user_confirming_end(self, transcript: str) -> bool:
-        """Check if the user is confirming call end."""
-        lower = transcript.lower().strip()
-        for kw in self._end_confirm_keywords:
-            if kw.lower() in lower:
-                return True
-        return False
-
-    async def _initiate_end_confirmation(self, status: str):
-        """Ask the user before ending the call. Waits for any ongoing TTS to finish first."""
-        self._end_confirmation_pending = True
-        self._end_confirmation_status = status
-        # Wait for current TTS to finish generating
+    async def _finish_call(self, status: str):
+        """End the call after current speech finishes playing."""
+        # Wait for TTS to finish generating
         while self.tts and self.tts.is_speaking:
             await asyncio.sleep(0.1)
-        # Wait a bit for phone playback after TTS generation finishes
-        if self._remaining_playback_sec > 0:
-            await asyncio.sleep(self._remaining_playback_sec)
-        # Small buffer so user hears the closing message fully
-        await asyncio.sleep(1)
-        await self._send_log(f"Asking end confirmation for status: {status}")
-        prompt = "சரி, வேற ஏதாவது இருக்கா? இல்லன்னா call cut பண்ணிடலாமா?"
-        self._last_agent_text = prompt
-        await self._speak(prompt)
+        await self._end_call(status)
 
     def _speak_is_question(self, text: str) -> bool:
         """Check if the speak text is a question (agent is asking something and should wait)."""
@@ -547,22 +554,35 @@ class VoiceAgent:
         - Audio-level: mic is blocked during TTS generation + 500ms buffer (handled in handle_media)
         - Transcript-level: any remaining echo is caught by _is_echo() in _on_transcript
         """
+        # Signal browser tester to flush accumulated MP3 chunks
+        try:
+            await self.exotel_ws.send_json({"event": "tts_done"})
+        except Exception:
+            pass
+
         now = asyncio.get_event_loop().time()
         self._tts_last_finished = now * 1000
         self._cancel_silence_timeout()
 
-        sample_rate = config.TTS_SAMPLE_RATE_TELEPHONY if not self.call_sid.startswith("test-") else config.TTS_SAMPLE_RATE
-        playback_sec = self._tts_audio_bytes / (sample_rate * 2) if self._tts_audio_bytes > 0 else 0.0
+        is_browser = self.call_sid.startswith("test-")
+        if is_browser:
+            # Browser tester: audio is MP3 (compressed, ~192kbps ≈ 24KB/s)
+            # and is buffered until tts_done flush — playback starts AFTER generation
+            playback_sec = self._tts_audio_bytes / 24000 if self._tts_audio_bytes > 0 else 0.0
+            self._remaining_playback_sec = playback_sec  # full duration, not reduced
+        else:
+            # Real telephony: raw PCM streams to phone during generation
+            sample_rate = config.TTS_SAMPLE_RATE_TELEPHONY
+            playback_sec = self._tts_audio_bytes / (sample_rate * 2) if self._tts_audio_bytes > 0 else 0.0
+            generation_sec = now - self._tts_speak_start if self._tts_speak_start > 0 else 0
+            self._remaining_playback_sec = max(0, playback_sec - generation_sec)
 
         if playback_sec < self.MIN_TTS_DURATION_FOR_SILENCE_TIMEOUT:
             await self._send_log(f"Short TTS ({playback_sec:.1f}s) — skipping silence timeout")
             return
 
-        generation_sec = now - self._tts_speak_start if self._tts_speak_start > 0 else 0
-        self._remaining_playback_sec = max(0, playback_sec - generation_sec)
-
         await self._send_log(
-            f"TTS done — playback ≈ {playback_sec:.1f}s gen, remaining ≈ {self._remaining_playback_sec:.1f}s"
+            f"TTS done — playback ≈ {playback_sec:.1f}s, remaining ≈ {self._remaining_playback_sec:.1f}s"
         )
 
         if not self._call_ended and not self._processing:
@@ -586,14 +606,6 @@ class VoiceAgent:
             # Wait for audio to finish playing on the phone, THEN wait for silence
             total_wait = self._remaining_playback_sec + self._silence_timeout_sec
             await asyncio.sleep(total_wait)
-            # Check end confirmation FIRST — webhook already sent
-            # but call is still open waiting for user to confirm end
-            if self._end_confirmation_pending:
-                if self._processing:
-                    return
-                await self._send_log("Silence after end confirmation — ending call")
-                await self._end_call(self._end_confirmation_status)
-                return
 
             if self._call_ended or self._processing:
                 return
@@ -601,8 +613,11 @@ class VoiceAgent:
             # If rejection is pending and vendor stayed silent, end call now
             if self._rejection_pending:
                 await self._send_log("Silence after rejection question — ending call with REJECTED")
+                goodbye = "சரி... நன்றி."
+                self._last_agent_text = goodbye
+                await self._speak(goodbye)
                 await self._send_webhook("REJECTED")
-                await self._initiate_end_confirmation("REJECTED")
+                await self._finish_call("REJECTED")
                 return
 
             self._silence_prompts_sent += 1
@@ -661,9 +676,33 @@ class VoiceAgent:
         except Exception as e:
             logger.error(f"Error sending audio: {e}")
 
+    def _release_key(self):
+        """Return the API key to the pool. Guarded against double-release."""
+        if self._key_released or not self._on_key_release:
+            return
+        self._key_released = True
+        try:
+            self._on_key_release()
+        except Exception as e:
+            logger.error(f"Error releasing API key: {e}")
+
+    async def _greeting_fallback_timeout(self):
+        """Safety net: if _on_tts_done never fires after greeting, start silence timeout."""
+        try:
+            await asyncio.sleep(15)
+            if not self._call_ended and not self._processing and not (
+                self._silence_timeout_task and not self._silence_timeout_task.done()
+            ):
+                await self._send_log("Greeting fallback: TTS done never fired — starting silence timeout")
+                self._start_silence_timeout()
+        except asyncio.CancelledError:
+            pass
+
     async def stop(self):
         logger.info(f"Agent stopping for call {self.call_sid}")
         self._cancel_silence_timeout()
+        if self._greeting_fallback_task and not self._greeting_fallback_task.done():
+            self._greeting_fallback_task.cancel()
         if self._flush_task and not self._flush_task.done():
             self._flush_task.cancel()
         if self.stt:
@@ -672,4 +711,5 @@ class VoiceAgent:
             await self.tts.close()
         if self.llm:
             await self.llm.close()
+        self._release_key()
         logger.info(f"Agent stopped for call {self.call_sid}")

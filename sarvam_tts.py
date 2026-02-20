@@ -16,12 +16,13 @@ class SarvamTTS:
     MAX_CONNECT_RETRIES = 3
 
     def __init__(self, on_audio: Callable, on_log: Callable = None, on_done: Callable = None,
-                 codec: str = None, sample_rate: int = None):
+                 codec: str = None, sample_rate: int = None, api_key: str = None):
         self.on_audio = on_audio
         self.on_log = on_log
         self.on_done = on_done
         self._codec = codec or config.TTS_CODEC
         self._sample_rate = sample_rate or config.TTS_SAMPLE_RATE
+        self._api_key = api_key or config.SARVAM_API_KEY
         self.ws = None
         self._listen_task: Optional[asyncio.Task] = None
         self._speaking = False
@@ -39,7 +40,7 @@ class SarvamTTS:
     async def connect(self):
         """Open WebSocket connection to Sarvam TTS and send config."""
         params = f"?model={config.TTS_MODEL}&send_completion_event=true"
-        headers = {"Api-Subscription-Key": config.SARVAM_API_KEY}
+        headers = {"Api-Subscription-Key": self._api_key}
 
         for attempt in range(self.MAX_CONNECT_RETRIES):
             try:
