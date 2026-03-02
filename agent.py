@@ -72,7 +72,7 @@ class VoiceAgent:
 
         # Terminal status values that end the call
         self._terminal_statuses = [
-            "ACCEPTED", "REJECTED", "CALLBACK_REQUESTED",
+            "ACCEPTED", "REJECTED", "MODIFIED", "CALLBACK_REQUESTED",
             "NO_RESPONSE",
         ]
         self._unclear_count = 0
@@ -504,6 +504,7 @@ class VoiceAgent:
         status_labels = {
             "ACCEPTED": "Order Accepted",
             "REJECTED": "Order Rejected",
+            "MODIFIED": "Order Modification Requested",
             "CALLBACK_REQUESTED": "Callback Requested",
             "NO_RESPONSE": "No Response",
             "UNCLEAR_RESPONSE": "Unclear Response",
