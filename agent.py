@@ -78,7 +78,13 @@ class VoiceAgent:
         self._unclear_count = 0
         self._max_unclear_before_end = 3
         self._rejection_reason = ""
-        self._rejection_pending = False
+        self._modification_reason = ""
+        self._confirmation_pending = None  # None or expected status: "ACCEPTED", "REJECTED", "MODIFIED"
+
+        # VAD speech duration tracking for noise filtering
+        self._vad_speech_start_time = 0.0  # timestamp when VAD detected speech start
+        self._last_speech_duration_ms = 0.0  # duration of last speech segment in ms
+        self.MIN_SPEECH_DURATION_MS = 200  # ignore speech shorter than this
 
         # Two-phase greeting: intro first, wait for any vendor response, then items
         self._greeting_phase = 0  # 0=normal, 1=waiting for vendor ack after intro
@@ -189,12 +195,16 @@ class VoiceAgent:
         if self._audio_chunks_received == 1:
             await self._send_log(f"Receiving mic audio... (STT connected={self.stt._connected if self.stt else 'N/A'})")
 
-        # ECHO SUPPRESSION: Block audio only during TTS generation + short buffer.
-        # Echo during remaining phone playback is caught at transcript level instead.
+        # ECHO SUPPRESSION: Block audio during TTS generation + remaining phone playback.
+        # Phone continues playing audio long after TTS finishes generating;
+        # blocking only 500ms was insufficient — echo of order items passed through.
         if self.tts and self.tts.is_speaking:
             return
-        if self._tts_last_finished > 0 and (now - self._tts_last_finished) < self.ECHO_BUFFER_MS:
-            return
+        if self._tts_last_finished > 0:
+            elapsed_ms = now - self._tts_last_finished
+            playback_buffer_ms = max(self.ECHO_BUFFER_MS, self._remaining_playback_sec * 1000)
+            if elapsed_ms < playback_buffer_ms:
+                return
 
         # Don't send if call already ended
         if self._call_ended:
@@ -267,7 +277,21 @@ class VoiceAgent:
 
         # Ignore very short transcripts (noise/echo artifacts)
         if len(text) < 3:
+            logger.info(f"FILTER: short transcript (<3 chars): '{text}'")
             await self._send_log(f"Ignored short transcript: '{text}'")
+            return
+
+        # Ignore transcripts from ultra-short speech (< 200ms = noise)
+        if self._last_speech_duration_ms < self.MIN_SPEECH_DURATION_MS:
+            logger.info(f"FILTER: noise ({self._last_speech_duration_ms:.0f}ms < {self.MIN_SPEECH_DURATION_MS}ms): '{text}'")
+            await self._send_log(f"Ignored noise ({self._last_speech_duration_ms:.0f}ms < {self.MIN_SPEECH_DURATION_MS}ms): '{text}'")
+            return
+
+        # During confirmation wait, filter short ambiguous transcripts (noise like "ம்.", "ஆ")
+        # But allow them during normal conversation (vendor might say "5", "12" for modify)
+        if self._confirmation_pending and len(text) <= 4:
+            logger.info(f"FILTER: short during confirmation: '{text}'")
+            await self._send_log(f"Ignored short transcript during confirmation wait: '{text}'")
             return
 
         # Echo detection: if transcript is a long phrase that overlaps heavily with agent's last speech, ignore
@@ -275,6 +299,7 @@ class VoiceAgent:
             await self._send_log(f"Echo detected, ignoring: '{text}'")
             return
 
+        logger.info(f"ACCEPTED transcript: '{text}' (duration={self._last_speech_duration_ms:.0f}ms, pending={self._confirmation_pending})")
         await self._send_log(f"You said: {text}")
 
         if not is_final:
@@ -321,32 +346,39 @@ class VoiceAgent:
             terminal = self._extract_terminal_status(status)
 
             if terminal:
-                if terminal == "REJECTED" and self._speak_is_question(speak_text):
-                    self._rejection_pending = True
-                    await self._send_log("Rejection pending — waiting for reason")
-                elif self._rejection_pending and terminal == "REJECTED":
-                    # Append any new reason piece
-                    new_reason = self._extract_reason_from_status(status) or text.strip()
-                    if new_reason and new_reason not in self._rejection_reason:
-                        if self._rejection_reason:
-                            self._rejection_reason += " | " + new_reason
-                        else:
-                            self._rejection_reason = new_reason
-                    await self._send_webhook("REJECTED")
-                    await self._finish_call("REJECTED")
-                else:
+                if self._confirmation_pending == terminal:
+                    # User confirmed — agent already asked, now end the call
+                    if terminal == "REJECTED":
+                        new_reason = self._extract_reason_from_status(status) or text.strip()
+                        if new_reason and new_reason not in self._rejection_reason:
+                            self._rejection_reason = (self._rejection_reason + " | " + new_reason) if self._rejection_reason else new_reason
+                    elif terminal == "MODIFIED":
+                        new_reason = self._extract_reason_from_status(status) or text.strip()
+                        if new_reason and new_reason not in self._modification_reason:
+                            self._modification_reason = (self._modification_reason + " | " + new_reason) if self._modification_reason else new_reason
+                    await self._send_log(f"User confirmed {terminal} — ending call")
                     await self._send_webhook(terminal)
                     await self._finish_call(terminal)
-            elif self._rejection_pending:
-                # Vendor gave reason but LLM didn't set terminal
-                new_reason = text.strip()
-                if new_reason:
-                    if self._rejection_reason:
-                        self._rejection_reason += " | " + new_reason
-                    else:
-                        self._rejection_reason = new_reason
-                await self._send_webhook("REJECTED")
-                await self._finish_call("REJECTED")
+                elif self._speak_is_question(speak_text):
+                    # Agent is asking a confirmation question — set pending, wait for user
+                    self._confirmation_pending = terminal
+                    if terminal == "REJECTED":
+                        reason = self._extract_reason_from_status(status)
+                        if reason:
+                            self._rejection_reason = reason
+                    elif terminal == "MODIFIED":
+                        reason = self._extract_reason_from_status(status)
+                        if reason:
+                            self._modification_reason = reason
+                    await self._send_log(f"Confirmation pending for {terminal} — waiting for user YES")
+                else:
+                    # Terminal status with no question — end call directly
+                    await self._send_webhook(terminal)
+                    await self._finish_call(terminal)
+            elif self._confirmation_pending:
+                # LLM didn't return terminal but we're waiting for confirmation
+                # The LLM should handle this — if user said yes, LLM returns terminal next turn
+                await self._send_log(f"Still waiting for {self._confirmation_pending} confirmation")
             # Silence timeout will restart when TTS finishes (in _on_tts_done)
         except Exception as e:
             await self._send_log(f"Error: {e}")
@@ -425,7 +457,7 @@ class VoiceAgent:
 
     def _extract_terminal_status(self, status: str) -> Optional[str]:
         """Check if the status string is a terminal status that ends the call.
-        Handles 'REJECTED | REASON: ...' format.
+        Handles 'REJECTED | REASON: ...' and 'MODIFIED | REASON: ...' formats.
         """
         if not status:
             return None
@@ -437,6 +469,13 @@ class VoiceAgent:
             if reason_match:
                 self._rejection_reason = reason_match.group(1).strip()
             return "REJECTED"
+
+        # Handle MODIFIED | REASON: ...
+        if upper.startswith("MODIFIED"):
+            reason_match = re.search(r'REASON:\s*(.+)', status, re.IGNORECASE)
+            if reason_match:
+                self._modification_reason = reason_match.group(1).strip()
+            return "MODIFIED"
 
         for terminal in self._terminal_statuses:
             if terminal in upper:
@@ -485,6 +524,8 @@ class VoiceAgent:
         }
         if status == "REJECTED" and self._rejection_reason:
             payload["rejection_reason"] = self._rejection_reason
+        if status == "MODIFIED" and self._modification_reason:
+            payload["modification_reason"] = self._modification_reason
 
         await self._send_log(f"Sending webhook: Status={status}")
         logger.info(f"Sending webhook to {config.WEBHOOK_URL}: {payload}")
@@ -611,14 +652,14 @@ class VoiceAgent:
             if self._call_ended or self._processing:
                 return
 
-            # If rejection is pending and vendor stayed silent, end call now
-            if self._rejection_pending:
-                await self._send_log("Silence after rejection question — ending call with REJECTED")
+            # If confirmation is pending and vendor stayed silent, end call now
+            if self._confirmation_pending:
+                await self._send_log(f"Silence after confirmation question — ending with {self._confirmation_pending}")
                 goodbye = "சரி... நன்றி."
                 self._last_agent_text = goodbye
                 await self._speak(goodbye)
-                await self._send_webhook("REJECTED")
-                await self._finish_call("REJECTED")
+                await self._send_webhook(self._confirmation_pending)
+                await self._finish_call(self._confirmation_pending)
                 return
 
             self._silence_prompts_sent += 1
@@ -650,9 +691,12 @@ class VoiceAgent:
         if signal == "speech_start":
             # Cancel silence timeout IMMEDIATELY — before any awaits
             self._cancel_silence_timeout()
+            self._vad_speech_start_time = asyncio.get_event_loop().time()
             await self._send_log("VAD: user speech detected")
         elif signal == "speech_end":
-            await self._send_log("VAD: user speech ended — flushing STT")
+            now = asyncio.get_event_loop().time()
+            self._last_speech_duration_ms = (now - self._vad_speech_start_time) * 1000 if self._vad_speech_start_time > 0 else 999
+            await self._send_log(f"VAD: user speech ended ({self._last_speech_duration_ms:.0f}ms) — flushing STT")
             if self.stt and self.stt._connected and not self._call_ended:
                 await self.stt.flush()
 

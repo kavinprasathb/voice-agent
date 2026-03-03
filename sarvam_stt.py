@@ -124,8 +124,10 @@ class SarvamSTT:
                     inner = data.get("data", {})
                     signal = inner.get("signal_type", "")
                     self._log(f"VAD: {signal}")
-                    if self.on_vad and signal in ("speech_start", "speech_end"):
-                        await self.on_vad(signal)
+                    if self.on_vad and signal.upper() in ("START_SPEECH", "END_SPEECH"):
+                        # Normalize to lowercase format expected by agent
+                        normalized = "speech_start" if "START" in signal.upper() else "speech_end"
+                        await self.on_vad(normalized)
 
                 elif msg_type == "error":
                     err = data.get("data", {})
