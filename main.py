@@ -32,8 +32,11 @@ sessions: dict[str, VoiceAgent] = {}
 # Sarvam API key pool for concurrent call support
 key_pool: Optional[SarvamKeyPool] = None
 
-# Firestore client for shared pending orders across container instances
+# Firestore client for shared pending orders across container instances (Cloud Run)
 PENDING_ORDERS_COLLECTION = "pending_orders"
+
+# In-memory fallback for single-server deployments (no Firestore needed)
+pending_orders: dict[str, dict] = {}
 
 
 @app.on_event("startup")
@@ -100,11 +103,14 @@ async def trigger_call(req: CallRequest):
         "items": [{"name": i.name, "qty": i.qty, "price": i.price, "variation": i.variation} for i in req.items],
     }
 
-    # Store in Firestore for cross-container WebSocket pickup
+    # Store order for WebSocket pickup: Firestore (Cloud Run) or in-memory (single server)
     norm_phone = _normalize_phone(phone)
     if db:
         db.collection(PENDING_ORDERS_COLLECTION).document(norm_phone).set(order_data)
         logger.info(f"Stored pending order in Firestore for {norm_phone}: {req.order_id}")
+    else:
+        pending_orders[norm_phone] = order_data
+        logger.info(f"Stored pending order in memory for {norm_phone}: {req.order_id}")
 
     # Ensure phone has country code for Exotel
     exotel_phone = phone if phone.startswith("91") else f"91{phone}"
@@ -136,10 +142,12 @@ async def trigger_call(req: CallRequest):
                 # Clean up pending order on failure
                 if db:
                     db.collection(PENDING_ORDERS_COLLECTION).document(norm_phone).delete()
+                pending_orders.pop(norm_phone, None)
                 return {"status": "error", "code": resp.status_code, "detail": resp.text[:300]}
     except Exception as e:
         if db:
             db.collection(PENDING_ORDERS_COLLECTION).document(norm_phone).delete()
+        pending_orders.pop(norm_phone, None)
         logger.error(f"Failed to trigger call: {e}")
         return {"status": "error", "detail": str(e)}
 
@@ -191,18 +199,22 @@ async def exotel_websocket(ws: WebSocket):
                         logger.error(f"Key pool checkout failed for {call_sid}: {e}")
                         break
 
-                # Look up order data: Firestore for real calls, start_data for browser tester
+                # Look up order data: Firestore (Cloud Run) or in-memory (single server)
                 order_data = None
-                if from_number and db:
+                if from_number:
                     norm = _normalize_phone(from_number)
-                    doc_ref = db.collection(PENDING_ORDERS_COLLECTION).document(norm)
-                    doc = doc_ref.get()
-                    if doc.exists:
-                        order_data = doc.to_dict()
-                        doc_ref.delete()
-                        logger.info(f"Found pending order in Firestore for {norm}: {order_data['order_id']}")
-                    else:
-                        logger.info(f"No pending order in Firestore for {norm}, using default")
+                    if db:
+                        doc_ref = db.collection(PENDING_ORDERS_COLLECTION).document(norm)
+                        doc = doc_ref.get()
+                        if doc.exists:
+                            order_data = doc.to_dict()
+                            doc_ref.delete()
+                            logger.info(f"Found pending order in Firestore for {norm}: {order_data['order_id']}")
+                    if not order_data and norm in pending_orders:
+                        order_data = pending_orders.pop(norm)
+                        logger.info(f"Found pending order in memory for {norm}: {order_data['order_id']}")
+                    if not order_data:
+                        logger.info(f"No pending order for {norm}, using default")
 
                 # Browser tester sends order data directly in start event
                 if not order_data and start_data.get("order_id"):
