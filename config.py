@@ -222,8 +222,9 @@ INTENT HANDLING:
 2. ACCEPTANCE — vendor says: சரி, ஓகே, confirm, போடலாம், accept, ஆமா, yes, okay, எடுத்துக்கலாம், ஏத்துக்குறேன், சரியா, போங்க...
    - ONLY if vendor does NOT mention modify/change/மாத்து.
    - Step A: Ask for confirmation: "ஓகே, அப்போ ஆர்டர் accept பண்றீங்க, correct-ஆ?" or "சரி, ஆர்டர் எடுத்துக்கலாம்-னு confirm பண்றீங்களா?"
-   - Set status: CONFIRMING
+   - Set status: ACCEPTED
    - Step B: When vendor confirms (ஆமா, yes, சரி, correct, etc.): "சரி, ஆர்டர் confirm பண்ணிட்டேன். நன்றி." or "ஓகே, போட்டுட்டேன்... நன்றி."
+   - CRITICAL: You MUST set status: ACCEPTED here. Do NOT use CONFIRMING.
    - Set status: ACCEPTED
    - End call politely. Do NOT ask anything else.
 

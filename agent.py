@@ -344,6 +344,7 @@ class VoiceAgent:
                 self._unclear_count = 0  # Reset on any clear response
 
             terminal = self._extract_terminal_status(status)
+            logger.info(f"STATUS: parsed='{status}' terminal={terminal} pending={self._confirmation_pending} is_question={self._speak_is_question(speak_text)}")
 
             if terminal:
                 if self._confirmation_pending == terminal:
@@ -356,9 +357,11 @@ class VoiceAgent:
                         new_reason = self._extract_reason_from_status(status) or text.strip()
                         if new_reason and new_reason not in self._modification_reason:
                             self._modification_reason = (self._modification_reason + " | " + new_reason) if self._modification_reason else new_reason
+                    logger.info(f"CALL END: User confirmed {terminal}")
                     await self._send_log(f"User confirmed {terminal} — ending call")
                     await self._send_webhook(terminal)
                     await self._finish_call(terminal)
+                    return
                 elif self._speak_is_question(speak_text):
                     # Agent is asking a confirmation question — set pending, wait for user
                     self._confirmation_pending = terminal
@@ -370,15 +373,25 @@ class VoiceAgent:
                         reason = self._extract_reason_from_status(status)
                         if reason:
                             self._modification_reason = reason
+                    logger.info(f"CONFIRMATION SET: pending={terminal}")
                     await self._send_log(f"Confirmation pending for {terminal} — waiting for user YES")
                 else:
                     # Terminal status with no question — end call directly
+                    logger.info(f"CALL END: Terminal {terminal} with no question — ending directly")
                     await self._send_webhook(terminal)
                     await self._finish_call(terminal)
-            elif self._confirmation_pending:
-                # LLM didn't return terminal but we're waiting for confirmation
-                # The LLM should handle this — if user said yes, LLM returns terminal next turn
-                await self._send_log(f"Still waiting for {self._confirmation_pending} confirmation")
+                    return
+            elif not terminal:
+                # LLM returned non-terminal (e.g. CONFIRMING) — check if speech implies call is done
+                implied = self._speak_implies_call_done(speak_text)
+                if implied:
+                    logger.info(f"CALL END: LLM said CONFIRMING but speech implies {implied} — ending call")
+                    await self._send_webhook(implied)
+                    await self._finish_call(implied)
+                    return
+                elif self._confirmation_pending:
+                    logger.info(f"WAITING: Still pending {self._confirmation_pending}, LLM returned non-terminal")
+                    await self._send_log(f"Still waiting for {self._confirmation_pending} confirmation")
             # Silence timeout will restart when TTS finishes (in _on_tts_done)
         except Exception as e:
             await self._send_log(f"Error: {e}")
@@ -415,6 +428,30 @@ class VoiceAgent:
             if marker in text:
                 return True
         return False
+
+    def _speak_implies_call_done(self, text: str) -> Optional[str]:
+        """Detect if the agent's speech implies the call is done (confirmed/rejected/modified).
+        Returns the implied terminal status or None.
+        LLM sometimes returns CONFIRMING status even when speech says 'confirm done, thanks'.
+        """
+        if not text:
+            return None
+        lower = text.lower()
+        # Agent says order is confirmed/accepted + thanks/bye
+        accept_phrases = ["confirm பண்ணிட்டேன்", "போட்டுட்டேன்", "confirm ஆயிடுச்சு", "accept ஆயிடுச்சு"]
+        reject_phrases = ["reject பண்ணிட்டேன்", "noted", "புரிஞ்சது"]
+        modify_phrases = ["modify request போட்டுட்டேன்", "forward பண்ணிட்டேன்", "request போட்டுட்டேன்"]
+
+        for phrase in modify_phrases:
+            if phrase in lower:
+                return "MODIFIED"
+        for phrase in reject_phrases:
+            if phrase in lower:
+                return "REJECTED"
+        for phrase in accept_phrases:
+            if phrase in lower:
+                return "ACCEPTED"
+        return None
 
     def _parse_llm_response(self, response: str) -> tuple[str, str]:
         """Parse <speak> and <status> tags from LLM response.
