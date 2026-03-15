@@ -107,7 +107,7 @@ class CallRequest(BaseModel):
     phone_number: str
     vendor_name: str
     company_name: str = "Keeggi"
-    order_id: str
+    order_id: str | int
     items: List[OrderItem]
 
 
@@ -130,7 +130,7 @@ async def trigger_call(req: CallRequest):
 
     # Build order data dict
     order_data = {
-        "order_id": req.order_id,
+        "order_id": str(req.order_id),
         "vendor_name": req.vendor_name,
         "company_name": req.company_name,
         "items": [{"name": i.name, "qty": i.qty, "price": i.price, "variation": i.variation} for i in req.items],
@@ -169,7 +169,7 @@ async def trigger_call(req: CallRequest):
                     "status": "ok",
                     "message": f"Call initiated to {phone}",
                     "call_sid": call_sid,
-                    "order_id": req.order_id,
+                    "order_id": str(req.order_id),
                 }
             else:
                 # Clean up pending order on failure
